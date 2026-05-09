@@ -1,61 +1,68 @@
-# GR-002 — Library PDF Upload & Browse — Planning + Build Summary
+# Conversation Summaries — GR-002 Library PDF Upload
 
-## Key decisions
+## Planning session: 2026-05-09
 
-### 1. Domain shape (Option A)
-We chose to implement the **full harness `library` aggregate** — `Library` aggregate root with `Artifact` internal entity persisted across two collections (`libraries`, `artifacts`) — even though the user-facing UX in v1 only ever shows a single Default library per user. The repo and service support multi-library; `LibraryService.uploadArtifact` simply auto-provisions a single `"My Library"` library on first call (`findOrCreateDefaultLibrary`), and `/library` renders that library's artifacts. This costs us almost nothing today and saves a future migration when multi-library UX lands.
+### Task definition
+Ticket `jira-tickets/todo/gr_002_library_pdf_upload.md` was used as the canonical source. It is fully specified: endpoints, validation rules, acceptance criteria, domain references, and design references are all unambiguous.
 
-### 2. Storage (Option B — direct GridFS)
-The harness manifesto recommends the "external capabilities behind a port" pattern (e.g. `pdf-storage.gateway.ts`). For GR-002 we deliberately diverged: a thin `gridfs-bucket.ts` wrapper in `platform/infrastructure/mongo/` is consumed directly by `LibraryMongoRepo`. The domain keeps `SourceFile.storageUri` opaque; the repo is the only place that parses the canonical `gridfs://<ObjectId>` scheme. If/when storage choice changes (e.g. S3, signed URLs), only the repo changes and the URI scheme is the contract.
+### Key design decisions
 
-### 3. PDF parsing is injected, not imported by the service
-`LibraryService` is constructed with `parsePdf: (Buffer) => Promise<{ pageCount }>` as its fourth dependency. The default implementation in `infrastructure/gateways/library/pdf-parse.adapter.ts` wraps `pdf-parse` (v2 class API: `new PDFParse(...)` + `getInfo().total`). This keeps the application ring free of the parser dependency and lets unit tests inject a deterministic stub.
+**Single `LibraryRepo` port for both collections and GridFS**
+The harness `knowledge/domain/library/data-model.md` explicitly states: "Single LibraryRepo port handles both collections; no separate ArtifactRepo." This means the one adapter (`LibraryMongoRepo`) extends `Repository<LibraryMongoDocument, Library>` for the primary collection, holds a second Typegoose model reference for `artifacts`, and manages a `GridFSBucket` for binary file storage. No separate `ArtifactRepo` or `FileStorageGateway` was created — that would contradict the domain's stated design.
 
-### 4. Status transitions are synchronous
-We do **not** introduce a worker or queue. `LibraryService.uploadArtifact` flows: `findOrCreateDefaultLibrary` → SHA-256 → common-case dedupe lookup → `addArtifactToLibrary` (status `processing`, GridFS write) → `parsePdf` → `updateArtifactStatus` (status `ready` with `pageCount` + `processedAt`). On parser failure, we roll back via `removeArtifact` (deletes both the artifact doc and its GridFS chunks) and surface `PdfParseError`.
+**`nameLower` shadow field**
+The `libraries` collection requires a `(userId, nameLower)` compound unique index to enforce case-insensitive library name uniqueness per user. `nameLower` is a derived, persistence-only field: it is NOT part of the domain `Library` entity. The repo adapter computes it (`name.toLowerCase()`) and injects it via `$set` before any insert/upsert. This keeps the domain entity clean.
 
-### 5. Multipart uploads stream through `busboy`
-We bypass React Router 7's `unstable_parseMultipartFormData` (which materialises files in memory) and pipe `Readable.fromWeb(request.body)` into `busboy`, with a hard `limits.fileSize = maxByteSize + 1` guard. Magic-byte sniff (`%PDF-`) happens inside `LibraryService.uploadArtifact` (8-byte buffer check, PDF 1.7 §7.5.2) so the controller stays thin and the rule lives next to the size guards.
+**`findOrCreateDefaultLibrary` upsert shape**
+Initial design used a plain `$set` upsert. During critique, it was noted that a plain `$set` upsert on a new document would overwrite `id` if two concurrent calls both trigger the insert path. The fix is `$setOnInsert: { id: crypto.randomUUID(), createdAt: now }` combined with `$set` for the mutable fields. The unique index on `(userId, nameLower)` ensures at most one document is created.
 
-### 6. Race-safe dedupe
-Two-layer defence: (1) common-case `findArtifactByHash` lookup short-circuits before GridFS write, (2) the `(libraryId, sourceFile.sha256Hash)` unique index in `artifacts` catches the rare race; the service catches Mongo `code: 11000` and re-throws as `DuplicateArtifactError`. The `library-mongo.repo.ts` adapter cleans up the orphaned GridFS file in the `addArtifactToLibrary` catch block.
+**busboy stays in the route layer**
+Multipart parsing is an HTTP transport concern — it belongs in the route handler, not the application service or controller. The route:
+1. Parses the multipart body with `busboy`
+2. Buffers the file into a `Buffer`
+3. Passes `(buffer, filename, mimeType)` to the controller
+The controller receives clean domain inputs, with no knowledge of the wire format.
 
-### 7. Naming aligns with the harness, not the ticket
-The original ticket described snake_case fields and a single `documents` collection. We updated `jira-tickets/todo/gr_002_library_pdf_upload.md` to use harness terminology — `userId`, `libraryId`, `sourceFile.sha256Hash` (camelCase), two collections, `Library` / `Artifact` — so future tickets and code reviews share the same vocabulary.
+**`byteSize` removed from service signature**
+Originally the plan had `uploadArtifact(userId, buffer, filename, mimeType, byteSize)`. During critique, it was noted this creates a redundant parameter that could diverge from `buffer.length`. The fix: derive `byteSize = buffer.length` inside the service; remove it from the signature entirely.
 
-## Things deliberately NOT done
+**`sourceFile.mimeType` always hardcoded to `'application/pdf'`**
+The browser-supplied MIME type from the multipart header is not trusted (per ticket spec). After the `%PDF-` magic-byte check passes, the service always stores `mimeType: 'application/pdf'` in `SourceFile` regardless of what the browser sent.
 
-- **Repository integration tests against a real MongoDB.** The plan listed them as ideal coverage for AC 8 (unique-index race) and AC 10 (GridFS round-trip), but the existing test setup has no Mongo container wiring. The in-memory `InMemoryLibraryRepo` mirrors the unique-index semantics (`code: 11000`) and the application unit tests cover the same paths. A follow-up ticket should add a docker-compose-backed integration test harness.
-- **Controller integration tests.** Same reason — multipart parsing through `busboy` is exercised manually via the live route during development; a fully isolated controller test would need to fabricate `Request` objects with multipart bodies, which is plumbing-heavy.
-- **PDF thumbnails / cover extraction.** Out of scope for v1 per the ticket.
-- **Multi-library UX.** Out of scope for v1 per the ticket.
-- **Search wiring.** The search input is rendered `disabled`.
+**`PdfParser` as an injected gateway port**
+The ticket explicitly states pdf-parse should be "injected into LibraryService so the application ring stays free of the parser dependency." A `PdfParser` interface lives in `application/library/pdf-parser.ts`. `PdfParseAdapter` (wrapping the `pdf-parse` npm package) lives in `infrastructure/gateways/pdf-parse/` and is wired in `application.instances.ts`. This keeps the application layer independently testable.
 
-## Files added
+**pdf-parse failure rollback**
+If `pdfParser.getPageCount(buffer)` throws after the file has already been stored in GridFS and the artifact saved, the service must clean up:
+1. `repo.deleteFile(storageUri)` — remove GridFS chunks
+2. `repo.deleteArtifact(artifactId)` — remove artifact document
+3. Re-throw as `InvalidFileTypeError`
 
-- `app/backend.server/domain/library/{library.ts,artifact.ts,library.repo.ts}` — domain entities + Zod schemas + repo port.
-- `app/backend.server/application/library/{library.service.ts,library.dto.ts,errors.ts,config.ts}` — application use cases.
-- `app/backend.server/platform/infrastructure/mongo/gridfs-bucket.ts` — GridFS wrapper.
-- `app/backend.server/infrastructure/repositories/library/{library-mongo.model.ts,artifact-mongo.model.ts,library-mongo.repo.ts}` — Mongo adapter.
-- `app/backend.server/infrastructure/api/library/{library.controller.ts,multipart.ts}` — controller + busboy multipart parser.
-- `app/backend.server/infrastructure/gateways/library/pdf-parse.adapter.ts` — `pdf-parse` adapter.
-- `app/routes/api/api.library.artifacts.{upload,_sdk}.ts`, `api.library.artifacts.ts`, `api.library.artifacts.$artifactId.ts` — API routes + client SDK.
-- `app/ui.client/components/domain/library/{LibraryView,Sidebar,TopAppBar,UploadDropzone,DocumentGrid,DocumentCard}.tsx` — UI components.
-- `app/ui.client/components/domain/library/hooks/{use-upload-artifact,use-document-toasts}.ts` — UI hooks.
-- `tests/backend.server/application/{shared/in-memory-library-repo.ts,library/library.service.test.ts}` — application tests + in-memory repo (29 tests).
+This prevents orphaned GridFS entries and half-saved artifacts.
 
-## Files modified
+**Auth pattern: `enforceAuth` directly, not middleware array**
+The `add-page-route.md` skill shows a `middleware = [requireAuth(loginController)]` pattern, but the existing codebase does not implement the React Router middleware array — `auth-middleware.server.ts` exports only `enforceAuth` and `unauthenticatedJson`. All routes call `enforceAuth(loginController, request)` at the top of their loader/action. This plan follows the existing pattern.
 
-- `app/backend.server/main/{run-config.ts,application.instances.ts,controller.instances.ts}` — wired in `LibraryConfig`, `LibraryMongoRepo`, `LibraryService`, `LibraryController`.
-- `app/routes/pages/library.tsx` — replaced welcome placeholder with the real loader + `LibraryView`.
-- `jira-tickets/todo/gr_002_library_pdf_upload.md` — aligned wording with the harness domain model.
-- `harness/knowledge/domain/library/data-model.md` — documented v1 single-default-library + `gridfs://` URI scheme.
-- `.env.example` — documented optional `LIBRARY_*` overrides.
-- `package.json` — added `busboy`, `pdf-parse`, `uuid` (and types).
+**Hard delete for artifacts**
+The domain model says "soft deletes only" for Libraries (they are deactivated, never deleted). For Artifacts, the ticket is explicit: "DELETE — removes the artifact and its GridFS chunks." The plan implements a hard delete (GridFS first, then artifact document), consistent with the ticket's stated behaviour.
 
-## Verification
+**`@index` decorators on Typegoose models**
+Compound indexes were initially described in prose only, which creates risk of a Coding Agent missing them. After critique they are spelled out with concrete `@index` decorator syntax on the model classes:
+- `@index({ userId: 1, nameLower: 1 }, { unique: true })` on `LibraryMongoModel`
+- `@index({ libraryId: 1, 'sourceFile.sha256Hash': 1 }, { unique: true })` on `ArtifactMongoModel`
+- `@index({ libraryId: 1, uploadStatus: 1, kind: 1 })` on `ArtifactMongoModel`
 
-- `npm run typecheck` passes.
-- `npm run test` — 38 tests pass (29 new for `LibraryService`, 9 pre-existing for auth).
-- `npm run build` — production build succeeds.
-- Manual smoke pending against `designs/library_scholastic_ai/screen.png` (sidebar 280 px, header 64 px, dashed dropzone, 1/2/3/4-col grid).
+**SDK transport split**
+`callUploadArtifactAPI` uses raw `fetch` with `FormData` (multipart/form-data). The other SDK functions use `requestInternalAPI` (JSON). This split is intentional and documented — `requestInternalAPI` handles JSON only and cannot send multipart.
+
+**Missing `file` field guard**
+busboy will simply not emit a `file` event if the client sends a multipart body with no `file` field. Without an explicit guard, the action would hang or silently pass an empty buffer. The plan adds a `fileReceived` boolean that the busboy `finish` handler checks before proceeding.
+
+### Critique triage
+All 6 critique points were accepted by the human without modification:
+1. Guard for missing `file` field in multipart → accepted
+2. Explicit `@index` decorator examples → accepted
+3. `findOrCreateDefaultLibrary` `$setOnInsert` upsert shape → accepted
+4. SDK transport split documentation → accepted
+5. Remove `byteSize` from service signature → accepted
+6. Always hardcode `sourceFile.mimeType = 'application/pdf'` → accepted

@@ -1,42 +1,22 @@
-import { Readable } from "node:stream";
-import { getModelForClass } from "@typegoose/typegoose";
-import type { Model } from "mongoose";
+import mongoose from "mongoose";
+import { GridFSBucket, ObjectId } from "mongodb";
+import { getModelForClass, type ReturnModelType } from "@typegoose/typegoose";
 import { Repository } from "@backend-platform/infrastructure/mongo/repository";
 import type { MongoDBClient } from "@backend-platform/infrastructure/mongo/client";
-import type { GridFsBucket } from "@backend-platform/infrastructure/mongo/gridfs-bucket";
-import { artifactSchema, type Artifact } from "@backend-domain/library/artifact";
 import { librarySchema, type Library } from "@backend-domain/library/library";
-import type {
-  ArtifactBinaryReadHandle,
-  ArtifactStatusUpdate,
-  LibraryRepo,
-  PersistArtifactInput,
-} from "@backend-domain/library/library.repo";
+import { artifactSchema, type Artifact, type ArtifactStatus } from "@backend-domain/library/artifact";
+import type { LibraryRepo } from "@backend-domain/library/library.repo";
 import { LibraryMongoModel, type LibraryMongoDocument } from "./library-mongo.model";
 import { ArtifactMongoModel, type ArtifactMongoDocument } from "./artifact-mongo.model";
-
-const STORAGE_URI_PREFIX = "gridfs://";
-
-function buildStorageUri(fileId: string): string {
-  return `${STORAGE_URI_PREFIX}${fileId}`;
-}
-
-function parseStorageUri(storageUri: string): string | null {
-  if (!storageUri.startsWith(STORAGE_URI_PREFIX)) return null;
-  const fileId = storageUri.slice(STORAGE_URI_PREFIX.length);
-  return fileId.length > 0 ? fileId : null;
-}
 
 export class LibraryMongoRepo
   extends Repository<LibraryMongoDocument, Library>
   implements LibraryRepo
 {
-  private readonly artifactModel: Model<ArtifactMongoDocument>;
+  private readonly artifactModel: ReturnModelType<typeof ArtifactMongoModel>;
+  private gridFSBucket: GridFSBucket | null = null;
 
-  constructor(
-    mongoClient: MongoDBClient,
-    private readonly gridFsBucket: GridFsBucket,
-  ) {
+  constructor(mongoClient: MongoDBClient) {
     super({
       entityClass: LibraryMongoModel,
       mongoClient,
@@ -45,196 +25,120 @@ export class LibraryMongoRepo
     });
     this.artifactModel = getModelForClass(ArtifactMongoModel, {
       options: { customName: "artifacts" },
-    }) as unknown as Model<ArtifactMongoDocument>;
+    }) as ReturnModelType<typeof ArtifactMongoModel>;
   }
 
-  public async listLibrariesForUser(userId: string): Promise<Library[]> {
+  private getGridFSBucket(): GridFSBucket {
+    if (!this.gridFSBucket) {
+      this.gridFSBucket = new GridFSBucket(mongoose.connection.db!, { bucketName: "pdfs" });
+    }
+    return this.gridFSBucket;
+  }
+
+  private documentToArtifact(doc: ArtifactMongoDocument): Artifact {
+    const { _id: _ignored, ...data } = doc.toObject({ versionKey: false }) as Record<string, unknown> & {
+      _id: unknown;
+    };
+    return artifactSchema.parse(data);
+  }
+
+  async findOrCreateDefaultLibrary(userId: string): Promise<Library> {
     await this.mongoClient.ensureConnection();
-    const docs = await this.model.find({ userId }).sort({ createdAt: 1 }).exec();
-    return docs.map((doc) => this.documentToEntity(doc));
-  }
-
-  public async saveLibrary(library: Library): Promise<Library> {
-    await this.mongoClient.ensureConnection();
-    const validated = librarySchema.parse(library);
-    const nameLower = validated.name.trim().toLowerCase();
-    const upserted = await this.model
-      .findOneAndUpdate(
-        { id: validated.id },
-        { $set: { ...validated, nameLower } },
-        { new: true, upsert: true, returnDocument: "after" },
-      )
-      .exec();
-    return this.documentToEntity(upserted);
-  }
-
-  public async addArtifactToLibrary(
-    userId: string,
-    input: PersistArtifactInput,
-  ): Promise<Artifact> {
-    await this.assertLibraryOwnedByUser(userId, input.libraryId);
-
-    const upload = await this.gridFsBucket.uploadBuffer(
-      `${input.artifactId}.pdf`,
-      input.binary,
-      input.mimeType,
-    );
-
     const now = new Date();
-    const artifact: Artifact = artifactSchema.parse({
-      id: input.artifactId,
-      libraryId: input.libraryId,
-      title: input.title,
-      kind: input.kind,
-      uploadStatus: input.uploadStatus,
-      sourceFile: {
-        storageUri: buildStorageUri(upload.fileId),
-        byteSize: input.byteSize,
-        mimeType: input.mimeType,
-        sha256Hash: input.sha256Hash,
+    const doc = await this.model.findOneAndUpdate(
+      { userId, nameLower: "my library" },
+      {
+        $set: { userId, name: "My Library", nameLower: "my library", isActive: true, updatedAt: now },
+        $setOnInsert: { id: crypto.randomUUID(), createdAt: now },
       },
-      uploadedAt: input.uploadedAt,
-      createdAt: now,
-      updatedAt: now,
-    });
-
-    try {
-      await this.artifactModel.create(artifact);
-    } catch (error) {
-      await this.gridFsBucket.delete(upload.fileId).catch(() => undefined);
-      throw error;
-    }
-
-    return artifact;
+      { upsert: true, new: true },
+    );
+    return this.documentToEntity(doc!);
   }
 
-  public async listArtifactsForLibrary(
-    userId: string,
-    libraryId: string,
-  ): Promise<Artifact[]> {
-    const owned = await this.isLibraryOwnedByUser(userId, libraryId);
-    if (!owned) return [];
-    const docs = await this.artifactModel
-      .find({ libraryId, uploadStatus: { $ne: "removed" } })
-      .sort({ uploadedAt: -1 })
-      .exec();
-    return docs.map((doc) => this.parseArtifactDoc(doc));
-  }
-
-  public async getArtifactById(
-    userId: string,
-    libraryId: string,
-    artifactId: string,
-  ): Promise<Artifact | null> {
-    const owned = await this.isLibraryOwnedByUser(userId, libraryId);
-    if (!owned) return null;
-    const doc = await this.artifactModel.findOne({ id: artifactId, libraryId }).exec();
-    return doc ? this.parseArtifactDoc(doc) : null;
-  }
-
-  public async findArtifactByHash(
-    userId: string,
-    libraryId: string,
-    sha256Hash: string,
-  ): Promise<Artifact | null> {
-    const owned = await this.isLibraryOwnedByUser(userId, libraryId);
-    if (!owned) return null;
-    const doc = await this.artifactModel
-      .findOne({
-        libraryId,
-        "sourceFile.sha256Hash": sha256Hash,
-        uploadStatus: { $ne: "removed" },
-      })
-      .exec();
-    return doc ? this.parseArtifactDoc(doc) : null;
-  }
-
-  public async updateArtifactStatus(
-    userId: string,
-    libraryId: string,
-    artifactId: string,
-    update: ArtifactStatusUpdate,
-  ): Promise<Artifact> {
-    await this.assertLibraryOwnedByUser(userId, libraryId);
-    const set: Record<string, unknown> = {
-      uploadStatus: update.uploadStatus,
-      updatedAt: update.updatedAt,
-    };
-    const unset: Record<string, unknown> = {};
-    if (update.pageCount !== undefined) set.pageCount = update.pageCount;
-    else unset.pageCount = "";
-    if (update.processedAt !== undefined) set.processedAt = update.processedAt;
-    else unset.processedAt = "";
-
-    const updated = await this.artifactModel
-      .findOneAndUpdate(
-        { id: artifactId, libraryId },
-        { $set: set, ...(Object.keys(unset).length > 0 ? { $unset: unset } : {}) },
-        { returnDocument: "after" },
-      )
-      .exec();
-    if (!updated) {
-      throw new Error(`Artifact ${artifactId} not found in library ${libraryId}`);
-    }
-    return this.parseArtifactDoc(updated);
-  }
-
-  public async removeArtifact(
-    userId: string,
-    libraryId: string,
-    artifactId: string,
-  ): Promise<void> {
-    const owned = await this.isLibraryOwnedByUser(userId, libraryId);
-    if (!owned) return;
-    const existing = await this.artifactModel
-      .findOne({ id: artifactId, libraryId })
-      .exec();
-    if (!existing) return;
-    const fileId = parseStorageUri(existing.sourceFile.storageUri);
-    if (fileId) {
-      await this.gridFsBucket.delete(fileId).catch(() => undefined);
-    }
-    await this.artifactModel.deleteOne({ id: artifactId, libraryId }).exec();
-  }
-
-  public async openArtifactBinary(
-    userId: string,
-    libraryId: string,
-    artifactId: string,
-  ): Promise<ArtifactBinaryReadHandle | null> {
-    const artifact = await this.getArtifactById(userId, libraryId, artifactId);
-    if (!artifact) return null;
-    const fileId = parseStorageUri(artifact.sourceFile.storageUri);
-    if (!fileId) return null;
-    const stream = await this.gridFsBucket.openDownloadStream(fileId);
-    return {
-      stream: stream as unknown as Readable,
-      mimeType: artifact.sourceFile.mimeType,
-      byteSize: artifact.sourceFile.byteSize,
-    };
-  }
-
-  private async assertLibraryOwnedByUser(userId: string, libraryId: string): Promise<void> {
-    const owned = await this.isLibraryOwnedByUser(userId, libraryId);
-    if (!owned) {
-      throw new Error(`Library ${libraryId} does not belong to user ${userId}`);
-    }
-  }
-
-  private async isLibraryOwnedByUser(userId: string, libraryId: string): Promise<boolean> {
+  async addArtifactToLibrary(userId: string, libraryId: string, artifact: Artifact): Promise<Artifact> {
     await this.mongoClient.ensureConnection();
-    const exists = await this.model.exists({ id: libraryId, userId });
-    return exists !== null;
+    await this._verifyLibraryBelongsToUser(userId, libraryId);
+    const doc = await this.artifactModel.create(artifact);
+    return this.documentToArtifact(doc);
   }
 
-  private parseArtifactDoc(doc: ArtifactMongoDocument): Artifact {
-    const raw = doc.toObject({ versionKey: false });
-    const { _id: _ignored, ...rest } = raw as Record<string, unknown> & { _id: unknown };
-    const result = artifactSchema.safeParse(rest);
-    if (result.success) return result.data;
-    const details = result.error.issues
-      .map((issue) => `  ${issue.path.join(".")}: ${issue.message}`)
-      .join("\n");
-    throw new Error(`[artifacts] Database data failed Zod validation:\n${details}`);
+  async getArtifactById(userId: string, libraryId: string, artifactId: string): Promise<Artifact | null> {
+    await this.mongoClient.ensureConnection();
+    await this._verifyLibraryBelongsToUser(userId, libraryId);
+    const doc = await this.artifactModel.findOne({ libraryId, id: artifactId });
+    return doc ? this.documentToArtifact(doc) : null;
+  }
+
+  async listArtifactsForLibrary(userId: string, libraryId: string): Promise<Artifact[]> {
+    await this.mongoClient.ensureConnection();
+    await this._verifyLibraryBelongsToUser(userId, libraryId);
+    const docs = await this.artifactModel
+      .find({ libraryId, uploadStatus: { $nin: ["removed", "failed"] } })
+      .sort({ createdAt: -1 });
+    return docs.map((doc) => this.documentToArtifact(doc));
+  }
+
+  async findArtifactByHash(userId: string, libraryId: string, sha256Hash: string): Promise<Artifact | null> {
+    await this.mongoClient.ensureConnection();
+    await this._verifyLibraryBelongsToUser(userId, libraryId);
+    const doc = await this.artifactModel.findOne({ libraryId, "sourceFile.sha256Hash": sha256Hash });
+    return doc ? this.documentToArtifact(doc) : null;
+  }
+
+  async updateArtifactStatus(
+    userId: string,
+    libraryId: string,
+    artifactId: string,
+    status: ArtifactStatus,
+    opts?: { pageCount?: number; processedAt?: Date },
+  ): Promise<Artifact> {
+    await this.mongoClient.ensureConnection();
+    await this._verifyLibraryBelongsToUser(userId, libraryId);
+    const update: Record<string, unknown> = { uploadStatus: status, updatedAt: new Date() };
+    if (opts?.pageCount !== undefined) update.pageCount = opts.pageCount;
+    if (opts?.processedAt !== undefined) update.processedAt = opts.processedAt;
+    const doc = await this.artifactModel.findOneAndUpdate(
+      { libraryId, id: artifactId },
+      { $set: update },
+      { new: true },
+    );
+    if (!doc) throw new Error(`Artifact ${artifactId} not found`);
+    return this.documentToArtifact(doc);
+  }
+
+  async storeFile(buffer: Buffer, filename: string, mimeType: string): Promise<string> {
+    await this.mongoClient.ensureConnection();
+    const bucket = this.getGridFSBucket();
+    return new Promise<string>((resolve, reject) => {
+      const stream = bucket.openUploadStream(filename, { metadata: { contentType: mimeType } });
+      stream.on("error", reject);
+      stream.on("finish", () => resolve(`gridfs://${stream.id.toString()}`));
+      stream.end(buffer);
+    });
+  }
+
+  async readFile(storageUri: string): Promise<Buffer> {
+    await this.mongoClient.ensureConnection();
+    const objectId = new ObjectId(storageUri.replace("gridfs://", ""));
+    const bucket = this.getGridFSBucket();
+    return new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const stream = bucket.openDownloadStream(objectId);
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+      stream.on("error", reject);
+      stream.on("end", () => resolve(Buffer.concat(chunks)));
+    });
+  }
+
+  async deleteFile(storageUri: string): Promise<void> {
+    await this.mongoClient.ensureConnection();
+    const objectId = new ObjectId(storageUri.replace("gridfs://", ""));
+    await this.getGridFSBucket().delete(objectId);
+  }
+
+  private async _verifyLibraryBelongsToUser(userId: string, libraryId: string): Promise<void> {
+    const library = await this._findOne({ id: libraryId, userId } as Parameters<typeof this._findOne>[0]);
+    if (!library) throw new Error(`Library ${libraryId} not found for user`);
   }
 }

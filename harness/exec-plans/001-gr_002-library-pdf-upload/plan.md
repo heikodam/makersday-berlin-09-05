@@ -1,204 +1,597 @@
----
-name: gr-002 library pdf upload
-overview: "Implement GR-002 (Library PDF upload + browse) in full alignment with the harness `library` bounded context: `Library` aggregate (auto-created Default library per user) with `Artifact` internal entity persisted across two collections, GridFS for binaries via a thin platform wrapper, and a 1:1 `/library` view of the design."
-todos:
-  - id: domain
-    content: "Author domain layer: library.ts, artifact.ts (with SourceFile + state-machine .superRefine), library.repo.ts port"
-    status: completed
-  - id: application
-    content: "Author application layer: LibraryService, library.dto.ts, errors.ts, config.ts; cover ACs 4, 5, 7, 8, 9 with in-memory repo + injected pdf parser"
-    status: completed
-  - id: platform-gridfs
-    content: Add gridfs-bucket.ts wrapper in platform/infrastructure/mongo/ with header rationale
-    status: completed
-  - id: infra-repo
-    content: Add Typegoose models (library-mongo.model.ts, artifact-mongo.model.ts) and library-mongo.repo.ts adapter; storageUri uses gridfs://<id> scheme; integration test for AC 8 + AC 10
-    status: completed
-  - id: controller
-    content: Add LibraryController with busboy streaming, magic-byte sniff (8-byte buffer), error mapping (400/409/413/415); integration test mocking the service
-    status: completed
-  - id: composition
-    content: Wire LibraryConfig into run-config, instantiate repo + service in application.instances, export libraryController in controller.instances
-    status: completed
-  - id: routes
-    content: Add api.library.artifacts.upload.ts, api.library.artifacts.ts (GET list), api.library.artifacts.$artifactId.ts (GET stream + DELETE), and api.library.artifacts._sdk.ts; rewrite routes/pages/library.tsx loader
-    status: completed
-  - id: ui
-    content: "Build UI components in ui.client/components/domain/library/: LibraryView, Sidebar, TopAppBar, UploadDropzone (drag state + spinner), DocumentGrid + DocumentCard, hooks (use-upload-artifact, use-document-toasts)"
-    status: completed
-  - id: ticket-update
-    content: Update jira-tickets/todo/gr_002_library_pdf_upload.md to align with the harness domain model (camelCase, two collections, library/artifact terminology)
-    status: completed
-  - id: harness-doc
-    content: Add a one-line note in harness/knowledge/domain/library/data-model.md documenting the v1 single-default-library behaviour and the gridfs:// URI scheme
-    status: completed
-  - id: checks
-    content: Run npm run typecheck and npm run test; fix all errors; manual smoke against the design
-    status: completed
-  - id: exec-plan-and-pr
-    content: Save plan.md + conversation-summaries.md under harness/exec-plans/001-gr_002-library-pdf-upload/; create branch, commit, push, open draft PR labelled plan
-    status: in_progress
-isProject: false
+# GR-002 — Library PDF Upload
+
+## Context
+
+GR-002 implements the full vertical slice for library PDF upload — the data ingestion layer that makes Scholastic AI useful. Without it, the chat feature (GR-003) has no documents to ground on. The feature adds MongoDB GridFS binary storage, domain entities for `Library` and `Artifact`, an application service with all validation logic, four REST endpoints, and the complete `/library` UI screen (sidebar nav, drag-and-drop upload zone, "Recent Documents" card grid).
+
+The existing `app/routes/pages/library.tsx` is a stub ("coming soon") — it will be replaced entirely.
+
 ---
 
-## GR-002 — Library PDF Upload & Browse
+## New Packages Required
 
-> Workflow stage: `harness/dev-workflow/001_plan.md`. Plan output destination: `harness/exec-plans/001-gr_002-library-pdf-upload/{plan.md, conversation-summaries.md}`.
+```
+npm install busboy pdf-parse
+npm install -D @types/busboy @types/pdf-parse
+```
 
-### 1. Decisions resolved during planning
+- `busboy` — streaming multipart parser for the upload endpoint
+- `pdf-parse` — extracts page count from buffered PDF; injected into LibraryService via a port so the application ring stays dependency-free
 
-- **Domain shape — Option A.** Implement the full harness `library` aggregate. A user has many libraries in the model, but for GR-002 we **auto-provision a single "Default library"** per user (created lazily on first sign-in or first upload). `/library` shows that single library's artifacts. The `(libraryId, sha256Hash)` uniqueness rule satisfies the ticket's "duplicate within user" requirement because the user only has one library today. *Multi-library UX is a future ticket.*
-- **Storage — Option B.** Direct GridFS via a small `gridfs-bucket.ts` wrapper in `platform/infrastructure/mongo/`, used by `LibraryMongoRepo`. We do not introduce a `pdf-storage.gateway.ts` port today; if/when storage choice changes, that is the upgrade path. This is a deliberate, documented divergence from the harness manifesto's "external capabilities behind a port" guidance and will be called out in the ADR-style note inside `conversation-summaries.md`.
-- **Naming.** Follow the harness, not the ticket: `userId`, `libraryId`, `sourceFile.sha256Hash` (camelCase), not `user_id`/`sha256`. The ticket itself will be updated to match.
-- **Status state machine.** Synchronous in-request: `uploading` → after stream completes `processing` → after `pdf-parse` extracts `pageCount` → `ready`. On any failure: `failed`. No worker, no queue. Simple and adequate for MVP.
-- **Refresh strategy.** Server is the source of truth. The upload `action` returns the freshly inserted `ArtifactDto`; the page uses React Router's `useFetcher` so the `loader` revalidates and the new card appears at the top without a manual refresh.
+---
 
-### 2. New files (creation)
+## Files
 
-#### Domain (`app/backend.server/domain/library/`)
-- `library.ts` — `Library` entity + Zod schema. Fields: `id`, `userId`, `name`, `description?`, `isActive`, `createdAt`, `updatedAt`. `LibraryName` enforced inline as `z.string().trim().min(1)`.
-- `artifact.ts` — `Artifact` entity + Zod schema + nested `SourceFile` schema and `ArtifactKind`/`UploadStatus` enums. Cross-field invariants via `.superRefine`: `pageCount` and `processedAt` present iff `uploadStatus === "ready"`.
-- `library.repo.ts` — `LibraryRepo` port. Library-level: `getDefaultForUser(userId)`, `ensureDefaultForUser(userId)`. Artifact-level (all `userId`-scoped via parent library): `addArtifactToLibrary`, `getArtifactById`, `listArtifactsForLibrary`, `findArtifactByHash`, `updateArtifactStatus`, `removeArtifact`. **No method names betray Mongo.** Methods that read or persist binary content take/return Node `Readable` streams supplied by the application layer (e.g. `openArtifactBinary(userId, libraryId, artifactId): Promise<Readable>`).
+### New files
 
-#### Application (`app/backend.server/application/library/`)
-- `library.service.ts` — `LibraryService` orchestrating use cases:
-  - `ensureDefaultLibrary(userId)` — idempotent, returns the Default library.
-  - `uploadArtifact({ userId, fileName, byteSize, mimeType, stream })` — orchestrates streaming into the repo, hash compute, dedupe lookup, page-count extraction, status transitions, returns `ArtifactDto`. Throws application errors (below) for validation failures.
-  - `listArtifacts(userId)` — newest-first within Default library.
-  - `streamArtifactBinary(userId, artifactId): { mimeType, byteSize, stream }`.
-  - `removeArtifact(userId, artifactId)`.
-- `library.dto.ts` — `ArtifactDto`, `LibraryDto`, `UploadArtifactRequest` (the application-level use-case shape, *not* the wire shape), and pure mappers `toArtifactDto`, `toLibraryDto`.
-- `errors.ts` — `InvalidPdfError`, `FileTooSmallError`, `FileTooLargeError`, `DuplicateArtifactError`, `ArtifactNotFoundError`, `PdfParseError`. Plain classes with stable codes for the controller to translate.
-- `config.ts` — `LibraryConfig`: `minByteSize` (default 10 240), `maxByteSize` (default 26 214 400), `defaultLibraryName` ("My Library"). `fromEnv` reads `LIBRARY_MAX_UPLOAD_BYTES` (optional override) via `readFromEnv`.
+**Shared types** (UI needs these enums)
+- `app/shared/domain/library/artifact-status.ts`
+- `app/shared/domain/library/artifact-kind.ts`
 
-#### Infrastructure / API (`app/backend.server/infrastructure/api/library/`)
-- `library.controller.ts` — `LibraryController`. Methods:
-  - `getInitialState(request)` — fetches the user's Default library + artifact list for the page loader.
-  - `uploadArtifact(request)` — parses multipart (busboy stream), enforces the 25 MB hard cap before reading bytes (`Content-Length` check → 413 if exceeded), pipes the file part to `LibraryService.uploadArtifact`, maps application errors to JSON responses with status codes.
-  - `listArtifacts(request)`, `streamArtifactBinary(request, artifactId)`, `deleteArtifact(request, artifactId)`.
-- `request-schemas.ts` / `response-schemas.ts` — zod schemas for non-multipart endpoints + the response shape (`ArtifactResponse`, `ListArtifactsResponse`, `ErrorResponse`).
+**Domain layer**
+- `app/backend.server/domain/library/library.ts`
+- `app/backend.server/domain/library/artifact.ts`
+- `app/backend.server/domain/library/library.repo.ts`
 
-#### Infrastructure / Repositories (`app/backend.server/infrastructure/repositories/library/`)
-- `library-mongo.model.ts` — Typegoose model `LibraryMongoModel implements Library`. `nameLower` shadow field with compound unique index on `(userId, nameLower)` per `harness/knowledge/domain/library/data-model.md`.
-- `artifact-mongo.model.ts` — Typegoose model `ArtifactMongoModel implements Artifact`, embedded `SourceFileMongo` subdoc, indexes per the data-model: `id` unique, `libraryId`, `(libraryId, sourceFile.sha256Hash)` unique, `(libraryId, uploadStatus, kind)`.
-- `library-mongo.repo.ts` — `LibraryMongoRepo extends Repository<LibraryMongoDocument, Library> implements LibraryRepo`. Owns both collections; the only place that knows `artifacts` exists. Uses the new `gridFsBucket` for binary I/O. Tenancy enforced by always loading the parent library by `(userId, libraryId)` first.
+**Application layer**
+- `app/backend.server/application/library/config.ts`
+- `app/backend.server/application/library/errors.ts`
+- `app/backend.server/application/library/pdf-parser.ts` (gateway port)
+- `app/backend.server/application/library/library.dto.ts`
+- `app/backend.server/application/library/library.service.ts`
 
-#### Platform infrastructure (`app/backend.server/platform/infrastructure/mongo/`)
-- `gridfs-bucket.ts` — thin wrapper around `mongoose.mongo.GridFSBucket` exposing `openUploadStreamWithMetadata(metadata)`, `openDownloadStream(fileId)`, `delete(fileId)`. No domain types. Integration test in `tests/backend.server/infrastructure/`.
+**Infrastructure — repositories**
+- `app/backend.server/infrastructure/repositories/library/library-mongo.model.ts`
+- `app/backend.server/infrastructure/repositories/library/artifact-mongo.model.ts`
+- `app/backend.server/infrastructure/repositories/library/library-mongo.repo.ts`
 
-#### Composition root (`app/backend.server/main/`)
-- `run-config.ts` — extend `AppConfig` with `library: LibraryConfig`.
-- `application.instances.ts` — extend to instantiate `LibraryMongoRepo` and `LibraryService(libraryRepo, libraryConfig, () => new Date())`.
-- `controller.instances.ts` — export `libraryController = new LibraryController(app.libraryService)`.
+**Infrastructure — gateways**
+- `app/backend.server/infrastructure/gateways/pdf-parse/pdf-parse.adapter.ts`
 
-#### Routes (`app/routes/`)
-- `pages/library.tsx` — replace placeholder with real loader/component. Loader calls `libraryController.getInitialState(request)`, returns `{ user, library, artifacts }`. Component renders `<LibraryView />`. Continues to use `enforceAuth` from route-utils.
-- `api/api.library.artifacts.upload.ts` — `action` only, multipart POST → controller.
-- `api/api.library.artifacts.ts` — `loader` (list) and `action` (DELETE for the card overflow menu, dispatched via `_action` field on a small JSON body or `?intent=delete` query — final shape settled in the `_sdk`).
-- `api/api.library.artifacts.$artifactId.ts` — `loader` streams the original PDF (`Content-Type: application/pdf`, `Content-Disposition: inline`), `action` handles DELETE.
-- `api/api.library.artifacts._sdk.ts` — `callUploadArtifactApi(file)`, `callListArtifactsApi`, `callDeleteArtifactApi(id)`, `getArtifactDownloadUrl(id)`. Validates response shapes with Zod.
+**Infrastructure — API controller**
+- `app/backend.server/infrastructure/api/library.controller.ts`
 
-#### UI (`app/ui.client/components/domain/library/`)
-- `LibraryView.tsx` — page composition: `<Sidebar />` + `<TopAppBar />` + main area with `<UploadDropzone />` and `<DocumentGrid />`.
-- `Sidebar.tsx` — fixed 280 px nav, Library active, Chat / History as `aria-disabled` placeholders (mirrors GR-001 link-out treatment).
-- `TopAppBar.tsx` — 64 px sticky bar; the search input is rendered with `disabled` per ticket scope.
-- `UploadDropzone.tsx` — dashed dropzone, `dragenter`/`dragover` toggles a `is-drag-over` style (`border-primary` + `bg-surface-container` per design tokens), Browse button opens hidden `<input type="file" accept="application/pdf">`, single file, in-flight spinner overlay.
-- `DocumentGrid.tsx` + `DocumentCard.tsx` — `grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-gutter`. Card shows generic PDF icon (Material Symbols `picture_as_pdf`), title, "PDF" tag (always — categories out of scope), upload date, overflow menu with Delete.
-- `hooks/use-upload-artifact.ts` — encapsulates `useFetcher`-driven upload with optimistic-pending state, surfaces error toasts.
-- `hooks/use-document-toasts.ts` — small toast queue for size/type/dedupe errors; presentational toaster lives in `LibraryView.tsx`.
+**API routes + SDK**
+- `app/routes/api/api.library.artifacts.upload.ts`
+- `app/routes/api/api.library.artifacts.ts`
+- `app/routes/api/api.library.artifacts.$artifactId.ts`
+- `app/routes/api/api.library.artifacts._sdk.ts`
 
-#### Tests (`tests/backend.server/`)
-- `application/library/library.service.test.ts` — vitest, in-memory port, fixed clock. One test per acceptance criterion (see §4).
-- `application/shared/in-memory-library-repo.ts` — implements `LibraryRepo` over a `Map`; supports `seed` and inspection helpers (`artifactsFor(libraryId)`).
-- `infrastructure/repositories/library/library-mongo.repo.integration.test.ts` — round-trip test against a test database (uses existing `MongoDBClient`, `mongoDB.MONGO_DATABASE` overridden to `scholastic-ai-test`); covers index uniqueness on `(libraryId, sha256Hash)` and GridFS read-back.
-- `infrastructure/api/library/library-controller.integration.test.ts` — mocks `LibraryService`, asserts request validation, multipart parsing happy + failure paths, error → status mapping.
+**UI components**
+- `app/ui.client/components/domain/library/LibraryView.tsx`
+- `app/ui.client/components/domain/library/UploadZone.tsx`
+- `app/ui.client/components/domain/library/DocumentCard.tsx`
+- `app/ui.client/components/domain/library/hooks/use-upload.ts`
 
-### 3. Modifications (existing files)
+**Tests**
+- `tests/backend.server/application/library/library.service.test.ts`
 
-- `app/routes/pages/library.tsx` — replace welcome placeholder.
-- `app/backend.server/main/{run-config.ts,application.instances.ts,controller.instances.ts}` — wire library context.
-- `package.json` — add `busboy` (streaming multipart), `pdf-parse` (page count), `uuid` (already a transitive dep of typegoose; add as direct), and types where applicable. Verify these are computation-style libs allowed in `infrastructure/`.
-- `.env.example` — add `LIBRARY_MAX_UPLOAD_BYTES=26214400` (optional override).
-- `harness/knowledge/domain/library/data-model.md` — add a small note that v1 auto-provisions a single "My Library" per user (does not change the model, just documents the v1 product behaviour).
-- `jira-tickets/todo/gr_002_library_pdf_upload.md` — update wording to match the harness model: rename `documents` collection references to `Library`/`Artifact`/two collections, rename `sha256` → `sourceFile.sha256Hash`, rename snake_case fields to camelCase, replace "MongoDB GridFS via single collection" with "MongoDB GridFS via the `library-mongo.repo.ts` adapter"; preserve the user-visible acceptance criteria untouched. Move ticket to `jira-tickets/in-review/` only at PR time (not during planning).
+### Modified files
 
-### 4. Acceptance criteria → tests
+- `app/backend.server/main/run-config.ts` — add `LibraryConfig` slice
+- `app/backend.server/main/application.instances.ts` — wire `libraryRepo`, `libraryService`, `pdfParseAdapter`
+- `app/backend.server/main/controller.instances.ts` — wire `libraryController`
+- `app/routes/pages/library.tsx` — replace stub with loader + thin component
 
-| Ticket AC | Test type | Test |
-|---|---|---|
-| 1. Visual fidelity | Manual / future Playwright | Out of scope for vitest; capture screenshot in PR. |
-| 2. Drag & drop | Component (future jsdom test) | Manual for MVP; component is small and tokenised. |
-| 3. Browse files button | Manual | n/a |
-| 4. Persistence + appears at top | Application unit test | `uploads new artifact and listForUser returns it newest-first`. |
-| 5. Validation: too small (<10 KB) | Application unit test | `rejects with FileTooSmallError`; controller test asserts 400 + `"File is too small to be a valid PDF"`. |
-| 6. Validation: too large (>25 MB) | Controller integration test | Asserts `Content-Length` > 25 MB returns 413 before the body is read; controller never calls service. |
-| 7. Validation: wrong type | Application + controller test | Magic-byte sniff (`%PDF-` header) — service rejects with `InvalidPdfError`; controller maps to 415. |
-| 8. Validation: duplicate | Application unit test | Pre-seed an artifact with hash `H`; second upload of the same hash throws `DuplicateArtifactError`; controller maps to 409 with `"This document is already in your library"`. Repository integration test asserts the unique index actually fires. |
-| 9. Authorisation | Application unit test | Calls without a `userId` reject; user A cannot see/list user B's artifacts (parent-library lookup returns null). Loader-level `enforceAuth` already covered by GR-001 patterns. |
-| 10. GridFS storage + delete cleans up | Repository integration test | Upload writes a GridFS file; `removeArtifact` deletes both the artifact doc and its `gridfs_file_id`. |
+---
 
-### 5. Implementation order (TDD-friendly)
+## Implementation Approach
 
-1. Add domain (`library.ts`, `artifact.ts`, `library.repo.ts`) — typecheck only.
-2. Add `library.dto.ts`, `errors.ts`, `config.ts` and `library.service.ts` red→green against an in-memory `LibraryRepo`. Cover ACs 4, 5, 7, 8, 9 here.
-3. Add `gridfs-bucket.ts`, two Typegoose models, `library-mongo.repo.ts`. Repository integration test covers AC 8 (real index) and AC 10.
-4. Add `library.controller.ts` + multipart parsing. Controller integration test covers AC 6 and the error-mapping table.
-5. Wire composition root; add `api.library.*` routes and `_sdk`.
-6. Replace `routes/pages/library.tsx`; build UI components; wire `useFetcher` upload.
-7. Manual smoke against the design (ACs 1–3) + npm run typecheck + npm run test.
+### 1. Shared enums
 
-### 6. Risks & open assumptions
+```typescript
+// app/shared/domain/library/artifact-status.ts
+export const ARTIFACT_STATUS = ['uploading', 'processing', 'ready', 'failed', 'removed'] as const;
+export type ArtifactStatus = typeof ARTIFACT_STATUS[number];
 
-- **`pdf-parse` correctness on malformed PDFs.** Mitigation: wrap in try/catch; on failure transition artifact to `failed` and surface a "Could not read PDF" toast. Treated as a soft failure — the binary is still in GridFS, the user can re-upload.
-- **Memory pressure during page count.** `pdf-parse` reads the full buffer. For a 25 MB cap that's acceptable; we read it back from GridFS as a stream → buffer → parse. If we ever raise the cap we'll need a streaming parser.
-- **Multipart parsing transport.** `busboy` is pinned because it's small and does true streaming. React Router 7's `unstable_parseMultipartFormData` is **not** used (it materialises files in memory and locks us into a `File` API).
-- **Default library name collision.** `(userId, nameLower)` is unique. If a user later renames their library and a future feature creates another "My Library", it'll fail by design — acceptable for v1; addressed when multi-library UI lands.
-- **GridFS leakage on failed uploads.** If page-count or status update throws after the GridFS write, we orphan a file. Mitigation: `LibraryService.uploadArtifact` wraps the post-write steps in a try/catch and calls `gridFsBucket.delete(fileId)` on rollback. Integration test covers this path.
+// app/shared/domain/library/artifact-kind.ts
+export const ARTIFACT_KIND = ['pdf', 'research', 'article', 'dataset', 'book'] as const;
+export type ArtifactKind = typeof ARTIFACT_KIND[number];
+```
 
-### 7. Self-critique (per `harness/skills/planning/critique-coding-plan.md`)
+---
 
-#### Gaps & blind spots
-**Issue:** The plan treats artifact `(libraryId, sha256Hash)` uniqueness only at the index level; under concurrent uploads of the same hash, the index will reject the second insert mid-stream after GridFS has already accepted the bytes.
-**Suggestion:** In `LibraryService.uploadArtifact`, do a `findArtifactByHash` *before* opening the GridFS write to short-circuit the common case, and on the rare race where the unique-index insert throws after GridFS write, catch the duplicate-key error and `gridFsBucket.delete(fileId)` for cleanup. Add a dedicated test for the race path using two concurrent calls in the in-memory repo (which simulates by deferring inserts).
+### 2. Domain entities
 
-#### Robustness
-**Issue:** Magic-byte sniffing on the *first chunk only* will misclassify multipart streams whose first chunk is shorter than 5 bytes.
-**Suggestion:** Buffer the first 8 bytes from busboy's file stream before piping the rest into GridFS — reject if `header.subarray(0,5).toString() !== "%PDF-"`. Cite RFC 8118 / PDF 1.7 §7.5.2 in the comment.
+**`library.ts`** — camelCase throughout (per ticket and existing user.ts pattern). `nameLower` is a persistence-only shadow field and does NOT appear in the domain entity.
 
-#### Simplicity
-**Issue:** Two API route files (`api.library.artifacts.ts` for list+delete and `api.library.artifacts.$artifactId.ts` for stream+delete) split the delete logic awkwardly.
-**Suggestion:** Put list on `api.library.artifacts.ts` (GET only) and put both stream + delete on `api.library.artifacts.$artifactId.ts`. One delete handler total.
+```typescript
+export const librarySchema = z.object({
+  id: z.string().uuid(),
+  userId: z.string().uuid(),
+  name: z.string().min(1).max(255),
+  createdAt: z.date(),
+  updatedAt: z.date(),
+});
+export type Library = z.infer<typeof librarySchema>;
+```
 
-#### Testability
-**Issue:** The application service ends up with three injected dependencies (`repo`, `config`, `clock`) plus an implicit `pdf-parse` import — not injectable.
-**Suggestion:** Pass `parsePdf: (Buffer) => Promise<{ pageCount: number }>` as a fourth constructor arg, defaulted in `application.instances.ts` to a wrapper around `pdf-parse`. Tests inject a deterministic stub. Keeps the service free of `pdf-parse` import (pure-ish application ring).
+**`artifact.ts`** — `SourceFile` is a nested value object. `ArtifactStatus` and `ArtifactKind` are re-exported from `@shared/domain/library/`. Export helper predicates:
 
-#### Consistency
-**Issue:** `gridfs-bucket.ts` lives in `platform/infrastructure/mongo/` but is consumed by a single context (`library`); this borders on premature platformisation. The harness manifesto says platform code is "reusable backend-generic code… candidate for extraction".
-**Suggestion:** Keep it in `platform/infrastructure/mongo/` anyway — GridFS is a pure mongo capability that is genuinely reusable, not library-domain-coupled. Document the rationale in the file's header. (Triage: keep as planned.)
+```typescript
+export const sourceFileSchema = z.object({
+  storageUri: z.string(),   // opaque; canonical form is gridfs://<ObjectId>
+  byteSize: z.number().int().positive(),
+  mimeType: z.string(),
+  sha256Hash: z.string().length(64),
+});
 
-#### Maintainability
-**Issue:** The `LibraryService` swells with five use cases. The harness allows one service per context but we should pre-emptively keep methods short.
-**Suggestion:** Co-locate small private helpers (`provisionDefaultLibrary`, `transitionToReady`) inside the same file rather than splitting into multiple services prematurely. Re-evaluate after GR-003 lands.
+export const artifactSchema = z.object({
+  id: z.string().uuid(),
+  libraryId: z.string().uuid(),
+  title: z.string().min(1),
+  kind: z.enum(ARTIFACT_KIND),
+  uploadStatus: z.enum(ARTIFACT_STATUS),
+  sourceFile: sourceFileSchema,
+  pageCount: z.number().int().positive().optional(),
+  uploadedAt: z.date(),
+  processedAt: z.date().optional(),
+  createdAt: z.date(),
+  updatedAt: z.date(),
+});
+export type Artifact = z.infer<typeof artifactSchema>;
 
-#### Design principles
-**Issue:** The plan stores the GridFS file id as `sourceFile.storageUri` ("`gridfs://<id>`"), but `storageUri` is documented as opaque in the domain — embedding the protocol bakes in the storage choice.
-**Suggestion:** Treat `gridfs://` as the canonical URI scheme, document it in `harness/knowledge/domain/library/data-model.md` (one-line note), and keep parsing/dispatching of the URI inside `library-mongo.repo.ts` only. The domain still treats it as opaque; the repo is the only thing that knows the scheme.
+export function isReady(artifact: Artifact): boolean { return artifact.uploadStatus === 'ready'; }
+```
 
-### 8. Triage decisions
+**`library.repo.ts`** — single port for both collections and GridFS file storage:
 
-- Accept all critique points (1, 2, 3, 4, 6, 7) and fold them into the plan during execution.
-- Reject the platformisation worry (5) — `gridfs-bucket.ts` stays in `platform/infrastructure/mongo/` with a header comment.
+```typescript
+export interface LibraryRepo {
+  findOrCreateDefaultLibrary(userId: string): Promise<Library>;
+  findArtifactBySha256(libraryId: string, sha256Hash: string): Promise<Artifact | null>;
+  listArtifacts(libraryId: string): Promise<Artifact[]>;
+  getArtifact(libraryId: string, artifactId: string): Promise<Artifact | null>;
+  saveArtifact(artifact: Artifact): Promise<Artifact>;
+  deleteArtifact(artifactId: string): Promise<void>;
+  storeFile(buffer: Buffer, filename: string, mimeType: string): Promise<string>;  // returns gridfs://<ObjectId>
+  readFile(storageUri: string): Promise<Buffer>;
+  deleteFile(storageUri: string): Promise<void>;
+}
+```
 
-### 9. Out of plan / explicitly deferred
+---
 
-- Multi-library UX (sidebar list, per-library detail view, library creation/rename/archive).
-- PDF thumbnails / cover extraction.
-- Real `ArtifactKind` classification (everything is `pdf` for now).
-- Async processing pipeline (workers, queues).
-- Search input wiring.
-- Multi-file batch upload progress UI.
+### 3. Application layer
 
-### 10. Workflow next steps after approval
+**`config.ts`** — LibraryConfig class following the AuthConfig pattern:
 
-Per `harness/dev-workflow/001_plan.md` Step 9: branch (`feature/gr-002-library-pdf-upload`), commit `plan.md` + `conversation-summaries.md` to `harness/exec-plans/001-gr_002-library-pdf-upload/`, push, open a **draft** PR labelled `plan` with `marduSwanepoel` as reviewer (per the user-level `create-develop-pr` skill).
+```typescript
+export class LibraryConfig {
+  constructor(readonly maxUploadBytes: number) {}
+
+  static fromEnv(): LibraryConfig {
+    const env = readFromEnv(z.object({
+      LIBRARY_MAX_UPLOAD_BYTES: z.coerce.number().int().positive().default(26_214_400), // 25 MB
+    }));
+    return new LibraryConfig(env.LIBRARY_MAX_UPLOAD_BYTES);
+  }
+}
+```
+
+**`errors.ts`** — domain-meaningful error classes for controller/route to translate to HTTP status codes:
+
+```typescript
+export class FileTooSmallError extends Error {}          // → 400
+export class FileTooLargeError extends Error {}          // → 413
+export class InvalidFileTypeError extends Error {}       // → 415
+export class DuplicateArtifactError extends Error {}     // → 409
+export class ArtifactNotFoundError extends Error {}      // → 404
+```
+
+**`pdf-parser.ts`** — gateway port (lives in application layer per harness conventions):
+
+```typescript
+export interface PdfParser {
+  getPageCount(buffer: Buffer): Promise<number>;
+}
+```
+
+**`library.dto.ts`** — ArtifactDto mirrors the artifact shape for the API response:
+
+```typescript
+export interface ArtifactDto {
+  id: string;
+  libraryId: string;
+  title: string;
+  kind: ArtifactKind;
+  uploadStatus: ArtifactStatus;
+  pageCount?: number;
+  byteSize: number;
+  uploadedAt: string;   // ISO string — safe to serialise across HTTP boundary
+  processedAt?: string;
+}
+
+export function toArtifactDto(artifact: Artifact): ArtifactDto { ... }
+```
+
+**`library.service.ts`** — all business logic lives here:
+
+Upload flow (`uploadArtifact(userId, buffer, filename, mimeType)`):
+
+Note: `byteSize` is derived from `buffer.length` inside the service — it is NOT a parameter, preventing any possibility of caller mismatch.
+
+1. Derive `byteSize = buffer.length`
+2. Guard: `byteSize < 10_240` → `FileTooSmallError`
+3. Guard: `byteSize > config.maxUploadBytes` → `FileTooLargeError`
+4. Guard: first 5 bytes of buffer ≠ `%PDF-` → `InvalidFileTypeError`
+5. After magic-byte check passes, always store `sourceFile.mimeType = 'application/pdf'` — discard the browser-supplied MIME type (untrusted)
+6. Compute SHA-256 with `node:crypto` `createHash('sha256').update(buffer).digest('hex')`
+7. `repo.findOrCreateDefaultLibrary(userId)` → get `libraryId`
+8. `repo.findArtifactBySha256(libraryId, sha256Hash)` → if found → `DuplicateArtifactError`
+9. `repo.storeFile(buffer, filename, 'application/pdf')` → `storageUri`
+10. Build Artifact with `uploadStatus: 'processing'`, save via `repo.saveArtifact`
+11. Extract page count: `pdfParser.getPageCount(buffer)`, update artifact to `ready` + set `pageCount` + `processedAt`. On parser failure: delete file via `repo.deleteFile(storageUri)` + delete artifact via `repo.deleteArtifact` + re-throw as `InvalidFileTypeError`
+12. Return `toArtifactDto(updatedArtifact)`
+
+Other methods:
+- `listArtifacts(userId)` — find/create default library, list artifacts, return DTOs sorted newest first
+- `getArtifactFile(userId, artifactId)` — resolve default library, get artifact (throw `ArtifactNotFoundError` if absent), read file via `repo.readFile`, return `{ buffer, mimeType: 'application/pdf', filename: artifact.title }`
+- `deleteArtifact(userId, artifactId)` — resolve default library, get artifact, delete GridFS file via `repo.deleteFile(artifact.sourceFile.storageUri)`, then hard-delete artifact document via `repo.deleteArtifact`
+
+---
+
+### 4. Infrastructure: Typegoose models
+
+**`library-mongo.model.ts`**:
+
+```typescript
+@index({ userId: 1, nameLower: 1 }, { unique: true })
+@modelOptions({ schemaOptions: { timestamps: true, versionKey: false }, options: { allowMixed: Severity.ALLOW } })
+export class LibraryMongoModel implements Library {
+  @prop({ unique: true, required: true, type: String }) id!: string;
+  @prop({ required: true, type: String, index: true }) userId!: string;
+  @prop({ required: true, type: String }) name!: string;
+  @prop({ required: true, type: String }) nameLower!: string;  // shadow field for unique index; not in domain entity
+  @prop({ required: true, type: Date }) createdAt!: Date;
+  @prop({ required: true, type: Date }) updatedAt!: Date;
+}
+export type LibraryMongoDocument = DocumentType<LibraryMongoModel>;
+```
+
+**`artifact-mongo.model.ts`** — `SourceFileMongo` nested class + `ArtifactMongoModel`:
+
+```typescript
+class SourceFileMongo implements SourceFile {
+  @prop({ required: true, type: String }) storageUri!: string;
+  @prop({ required: true, type: Number }) byteSize!: number;
+  @prop({ required: true, type: String }) mimeType!: string;
+  @prop({ required: true, type: String }) sha256Hash!: string;
+}
+
+@index({ libraryId: 1, 'sourceFile.sha256Hash': 1 }, { unique: true })
+@index({ libraryId: 1, uploadStatus: 1, kind: 1 })
+@modelOptions({ schemaOptions: { timestamps: true, versionKey: false }, options: { allowMixed: Severity.ALLOW } })
+export class ArtifactMongoModel implements Artifact {
+  @prop({ unique: true, required: true, type: String }) id!: string;
+  @prop({ required: true, type: String, index: true }) libraryId!: string;
+  @prop({ required: true, type: String }) title!: string;
+  @prop({ required: true, type: String }) kind!: ArtifactKind;
+  @prop({ required: true, type: String }) uploadStatus!: ArtifactStatus;
+  @prop({ required: true, type: SourceFileMongo, _id: false }) sourceFile!: SourceFile;
+  @prop({ type: Number }) pageCount?: number;
+  @prop({ required: true, type: Date }) uploadedAt!: Date;
+  @prop({ type: Date }) processedAt?: Date;
+  @prop({ required: true, type: Date }) createdAt!: Date;
+  @prop({ required: true, type: Date }) updatedAt!: Date;
+}
+export type ArtifactMongoDocument = DocumentType<ArtifactMongoModel>;
+```
+
+---
+
+### 5. Infrastructure: LibraryMongoRepo
+
+Extends `Repository<LibraryMongoDocument, Library>` (primary collection = `libraries`). Holds a second model reference for `artifacts` and a lazily-initialised `GridFSBucket`.
+
+```typescript
+export class LibraryMongoRepo
+  extends Repository<LibraryMongoDocument, Library>
+  implements LibraryRepo
+{
+  private readonly artifactModel: Model<ArtifactMongoDocument>;
+  private gridFSBucket: GridFSBucket | null = null;
+
+  constructor(mongoClient: MongoDBClient) {
+    super({ entityClass: LibraryMongoModel, mongoClient, modelName: 'libraries', zodSchema: librarySchema });
+    this.artifactModel = getModelForClass(ArtifactMongoModel, {
+      options: { customName: 'artifacts' },
+    }) as unknown as Model<ArtifactMongoDocument>;
+  }
+
+  private getGridFSBucket(): GridFSBucket {
+    if (!this.gridFSBucket) {
+      // mongoose.connection.db is available after ensureConnection()
+      this.gridFSBucket = new GridFSBucket(mongoose.connection.db!, { bucketName: 'pdfs' });
+    }
+    return this.gridFSBucket;
+  }
+}
+```
+
+`findOrCreateDefaultLibrary`: uses `model.findOneAndUpdate` with `{ upsert: true, new: true }`. Filter on `{ userId, nameLower: 'my library' }`. Update shape:
+
+```typescript
+{
+  $set: { userId, name: 'My Library', nameLower: 'my library', updatedAt: now },
+  $setOnInsert: { id: crypto.randomUUID(), createdAt: now },
+}
+```
+
+This prevents `id` from being overwritten on concurrent upserts. After upsert, call `documentToEntity` to return a `Library`.
+
+`storeFile`: pipe buffer into GridFS via `bucket.openUploadStream(filename, { contentType: mimeType })`, collect the ObjectId from the `finish` event, return `gridfs://${id.toString()}`.
+
+`readFile` / `deleteFile`: parse ObjectId from `storageUri` using:
+```typescript
+const objectId = new ObjectId(storageUri.replace('gridfs://', ''));
+```
+`readFile` opens a download stream and collects chunks into a single `Buffer`. `deleteFile` calls `bucket.delete(objectId)`.
+
+`listArtifacts`: `this.artifactModel.find({ libraryId }).sort({ createdAt: -1 })` → map via `artifactSchema.parse`.
+
+`saveArtifact`: upsert on `{ id: artifact.id }` using `$set`.
+
+`deleteArtifact`: `this.artifactModel.deleteOne({ id: artifactId })`.
+
+`findArtifactBySha256`: `this.artifactModel.findOne({ libraryId, 'sourceFile.sha256Hash': sha256Hash })`.
+
+`getArtifact`: `this.artifactModel.findOne({ libraryId, id: artifactId })`.
+
+---
+
+### 6. Infrastructure: PdfParseAdapter
+
+```typescript
+// app/backend.server/infrastructure/gateways/pdf-parse/pdf-parse.adapter.ts
+import pdfParse from 'pdf-parse';
+import type { PdfParser } from '@backend-application/library/pdf-parser';
+
+export class PdfParseAdapter implements PdfParser {
+  async getPageCount(buffer: Buffer): Promise<number> {
+    const result = await pdfParse(buffer);
+    return result.numpages;
+  }
+}
+```
+
+---
+
+### 7. Infrastructure: LibraryController
+
+Thin driving adapter. Passes through to the service; caller (route) maps domain errors to HTTP status codes.
+
+```typescript
+export class LibraryController {
+  constructor(private readonly libraryService: LibraryService) {}
+
+  async upload(userId: string, buffer: Buffer, filename: string, mimeType: string) {
+    return this.libraryService.uploadArtifact(userId, buffer, filename, mimeType);
+  }
+
+  async listArtifacts(userId: string) {
+    return this.libraryService.listArtifacts(userId);
+  }
+
+  async getArtifactFile(userId: string, artifactId: string) {
+    return this.libraryService.getArtifactFile(userId, artifactId);
+  }
+
+  async deleteArtifact(userId: string, artifactId: string) {
+    return this.libraryService.deleteArtifact(userId, artifactId);
+  }
+}
+```
+
+---
+
+### 8. Composition root wiring
+
+**`run-config.ts`** — add `library: LibraryConfig.fromEnv()` to `AppConfig` constructor and `fromEnv`.
+
+**`application.instances.ts`** — add to `buildApplicationInstances`:
+```typescript
+const pdfParser = new PdfParseAdapter();
+const libraryRepo = new LibraryMongoRepo(mongoClient);
+const libraryService = new LibraryService(config.library, libraryRepo, pdfParser);
+```
+Return `libraryService` in the instances object.
+
+**`controller.instances.ts`** — add:
+```typescript
+export const libraryController = new LibraryController(app.libraryService);
+```
+
+---
+
+### 9. API Routes
+
+**`api.library.artifacts.upload.ts`** — `POST /api/library/artifacts/upload`
+
+Multipart parsing with busboy (transport concern — stays in route, not controller):
+1. Check `Content-Type` starts with `multipart/form-data` → else 400
+2. Create busboy instance with `limits: { files: 1, fileSize: config.library.maxUploadBytes + 1 }` to detect oversize early
+3. Pipe `Readable.fromWeb(request.body)` through busboy
+4. Collect file field named `file` into chunks array; track `truncated` flag and `fileReceived` boolean
+5. On busboy `finish`: if `!fileReceived` → return `data({ error: 'No file provided' }, { status: 400 })`
+6. On busboy `finish`: if `truncated` → return `data({ error: 'File exceeds the 25 MB limit' }, { status: 413 })`
+7. Call `libraryController.upload(ctx.user.id, buffer, filename, mimeType)` and map domain errors:
+   - `FileTooSmallError` → 400 `"File is too small to be a valid PDF"`
+   - `FileTooLargeError` → 413 `"File exceeds the 25 MB limit"`
+   - `InvalidFileTypeError` → 415 `"Only PDF files are supported"`
+   - `DuplicateArtifactError` → 409 `"This document is already in your library"`
+8. On success → `data({ artifact }, { status: 200 })`
+
+Auth: `enforceAuth(loginController, request)` at top of action — **not** middleware array (not implemented in this codebase).
+
+**`api.library.artifacts.ts`** — `GET /api/library/artifacts`
+
+Loader: `enforceAuth` → `libraryController.listArtifacts(ctx.user.id)` → `data({ artifacts })`.
+
+**`api.library.artifacts.$artifactId.ts`** — `GET + DELETE /api/library/artifacts/:artifactId`
+
+- Loader (GET): `enforceAuth` → `libraryController.getArtifactFile(ctx.user.id, params.artifactId)` → `new Response(buffer, { headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': 'inline' } })`
+- Action (DELETE): `enforceAuth` → `libraryController.deleteArtifact(ctx.user.id, params.artifactId)` → `data({ ok: true })`
+
+Both use `params.artifactId` from the route segment.
+
+**`api.library.artifacts._sdk.ts`** — client SDK:
+
+```typescript
+export async function callUploadArtifactAPI(file: File): Promise<{ artifact: ArtifactDto }> {
+  const form = new FormData();
+  form.append('file', file);
+  const res = await fetch('/api/library/artifacts/upload', { method: 'POST', body: form });
+  if (!res.ok) { const { error } = await res.json(); throw new Error(error); }
+  return res.json();
+}
+
+export function callListArtifactsAPI(): Promise<{ artifacts: ArtifactDto[] }> {
+  return requestInternalAPI('/api/library/artifacts', 'GET', ...);
+}
+
+export function callDeleteArtifactAPI(artifactId: string): Promise<void> {
+  return requestInternalAPI(`/api/library/artifacts/${artifactId}`, 'DELETE', ...);
+}
+```
+
+SDK transport split (intentional): raw `fetch` + `FormData` for upload (multipart); `requestInternalAPI` (JSON) for list and delete.
+
+---
+
+### 10. Page Route: `library.tsx`
+
+Replace stub entirely:
+```typescript
+export const meta = () => [{ title: 'Scholastic AI | Library' }];
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const ctx = await enforceAuth(loginController, request);
+  const artifacts = await libraryController.listArtifacts(ctx.user.id);
+  return { user: toAuthenticatedUserDto(ctx.user), artifacts };
+}
+
+export default function LibraryPage() {
+  const { artifacts } = useLoaderData<typeof loader>();
+  return <LibraryView initialArtifacts={artifacts} />;
+}
+```
+
+---
+
+### 11. UI Components
+
+**`LibraryView.tsx`** — root layout matching `designs/library_scholastic_ai/screen.png`:
+- Fixed `w-[280px]` left sidebar with Library (active) / Chat (`aria-disabled`) / History (`aria-disabled`) nav items
+- Sticky `h-16` top header with disabled search input, notification icon, settings icon, user avatar
+- Main scrollable content: `<UploadZone>` at top + "Recent Documents" heading + responsive grid of `<DocumentCard>`
+- Grid: `grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6`
+- Manages `artifacts` in `useState` (seeded from `initialArtifacts` prop). Passes `onUploadSuccess` to UploadZone (prepend) and `onDelete` to DocumentCard (filter out).
+
+**`UploadZone.tsx`** — drag-and-drop zone:
+- Dashed border: `border-2 border-dashed border-outline rounded-2xl`
+- `onDragOver` / `onDragLeave`: toggle `isDragging` state for hover style (`border-primary bg-surface-container`)
+- `onDrop` / file input `onChange`: call `useUpload.upload(file)`
+- Hidden `<input type="file" accept="application/pdf">` triggered by "Browse Files" button
+- Show `CircularProgress` spinner (or equivalent) while `isUploading`
+- Show inline error message when `error` is set
+
+**`DocumentCard.tsx`** — card showing:
+- `picture_as_pdf` Material Symbol icon as cover placeholder
+- Title (truncated to 2 lines)
+- Mint green "PDF" tag: `bg-functional text-on-functional text-label-caps`
+- Upload date formatted as `dd MMM yyyy`
+- Overflow menu (three-dot) with a single "Delete" action that calls `onDelete(artifact.id)` → `callDeleteArtifactAPI`
+
+**`hooks/use-upload.ts`**:
+```typescript
+export function useUpload(onSuccess: (artifact: ArtifactDto) => void) {
+  const [isUploading, setIsUploading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function upload(file: File) {
+    setIsUploading(true);
+    setError(null);
+    try {
+      const { artifact } = await callUploadArtifactAPI(file);
+      onSuccess(artifact);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Upload failed');
+    } finally {
+      setIsUploading(false);
+    }
+  }
+  return { upload, isUploading, error };
+}
+```
+
+---
+
+## Design token mapping
+
+From `designs/library_intelligence_system/DESIGN.md` and `tailwind.config.ts`:
+
+| Design concept | Tailwind class |
+|---|---|
+| Sidebar 280px | `w-[280px]` |
+| Header 64px | `h-16` |
+| Primary (Dark Petrol #002127) | `bg-primary` / `text-primary` |
+| Accent (Dark Periwinkle #08006f) | `text-accent` |
+| Mint Green tag | `bg-functional text-on-functional` |
+| Dashed upload zone | `border-2 border-dashed border-outline` |
+| Upload hover state | `border-primary bg-surface-container` |
+| Card border | `border border-outline-variant` |
+| Sidebar active item | `bg-secondary-container text-on-secondary-container` |
+
+---
+
+## Test strategy
+
+**`tests/backend.server/application/library/library.service.test.ts`**
+
+Tests warranted (custom logic beyond stock Zod):
+- Upload: rejects file < 10 KB → `FileTooSmallError`
+- Upload: rejects file > maxUploadBytes → `FileTooLargeError`
+- Upload: rejects file without `%PDF-` magic bytes → `InvalidFileTypeError`
+- Upload: rejects SHA-256 duplicate → `DuplicateArtifactError`
+- Upload: happy path → artifact saved with `ready` status, DTO returned
+- Upload: pdf-parse failure → GridFS file deleted, artifact deleted, re-throws `InvalidFileTypeError`
+- `listArtifacts`: returns DTOs newest-first
+
+Use an in-memory fake `LibraryRepo` (implements the port) and a fake `PdfParser`. No MongoDB.
+
+---
+
+## Resolved decisions
+
+| Decision | Resolution |
+|---|---|
+| `nameLower` in domain entity? | No — persistence-only shadow field, set by repo adapter before insert |
+| busboy in route vs application service | Route layer — it's an HTTP/transport concern; controller receives `Buffer` |
+| GridFS access pattern | `LibraryMongoRepo` holds a lazy-initialised `GridFSBucket` via `mongoose.connection.db` (available after `ensureConnection()`) |
+| SHA-256 dedupe race | Unique index `(libraryId, sourceFile.sha256Hash)` is the authoritative guard; pre-check is a fast-path optimisation |
+| pdf-parse failure rollback | Service catches parser error, deletes GridFS file + artifact, re-throws as `InvalidFileTypeError` |
+| Auth pattern | `enforceAuth` called directly in each route handler — matches existing library.tsx pattern; middleware array not implemented in this codebase |
+| `storageUri` parsing | `gridfs://<ObjectId>` parsed only inside `LibraryMongoRepo.readFile`/`deleteFile` via `new ObjectId(uri.replace('gridfs://', ''))` |
+| Single `LibraryRepo` for both collections | Yes — per `harness/knowledge/domain/library/data-model.md`: "Single LibraryRepo port handles both collections; no separate ArtifactRepo" |
+| Default library creation | `findOrCreateDefaultLibrary` uses `findOneAndUpdate` upsert with `$set` + `$setOnInsert` to prevent id overwrite on concurrent calls |
+| `byteSize` source | Derived from `buffer.length` inside service — not passed as a parameter |
+| `sourceFile.mimeType` | Always stored as `'application/pdf'` (hardcoded after magic-byte check); browser-supplied MIME is discarded |
+| Missing `file` field in multipart | busboy handler returns 400 `"No file provided"` if no `file` field received |
+| Compound indexes | Applied via `@index` decorators on Typegoose model classes |
+| Artifact delete | Hard delete: GridFS chunks deleted first, then artifact document removed |
+
+---
+
+## Verification
+
+1. `npm run typecheck` — zero errors
+2. `npm run build` — clean build
+3. `npm run test` — library.service unit tests pass
+4. `npm run dev` → navigate to `http://localhost:5173/library`
+5. Upload a valid PDF (> 10 KB, < 25 MB) → card appears immediately; persists after reload
+6. Upload same PDF again → toast "This document is already in your library"
+7. Upload a non-PDF renamed to `.pdf` → toast "Only PDF files are supported"
+8. Upload a file > 25 MB → toast "File exceeds the 25 MB limit"
+9. Delete a card → removed from grid
+10. MongoDB `libraries`, `artifacts`, `pdfs.files`, `pdfs.chunks` collections all have correct data

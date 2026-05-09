@@ -1,222 +1,106 @@
-import { createHash, randomUUID } from "node:crypto";
-import type { Artifact } from "@backend-domain/library/artifact";
-import type { Library } from "@backend-domain/library/library";
+import { createHash } from "node:crypto";
 import type { LibraryRepo } from "@backend-domain/library/library.repo";
+import type { Artifact } from "@backend-domain/library/artifact";
 import type { LibraryConfig } from "./config";
-import {
-  toArtifactDto,
-  toLibraryDto,
-  type ArtifactBinaryDto,
-  type ArtifactDto,
-  type LibraryDto,
-  type UploadArtifactRequest,
-} from "./library.dto";
+import type { PdfParser } from "./pdf-parser";
+import { type ArtifactDto, toArtifactDto } from "./library.dto";
 import {
   ArtifactNotFoundError,
   DuplicateArtifactError,
   FileTooLargeError,
   FileTooSmallError,
-  InvalidPdfError,
-  PdfParseError,
+  InvalidFileTypeError,
 } from "./errors";
 
-export interface ParsePdfResult {
-  pageCount: number;
+const MIN_UPLOAD_BYTES = 10_240;
+const PDF_MAGIC = Buffer.from("%PDF-");
+
+function isPdf(buffer: Buffer): boolean {
+  return buffer.subarray(0, 5).equals(PDF_MAGIC);
 }
 
-/**
- * Pluggable PDF parser. Defaulted at the composition root to a thin
- * wrapper around `pdf-parse`. Tests inject a deterministic stub so the
- * application service has no static dependency on `pdf-parse`.
- */
-export type ParsePdf = (buffer: Buffer) => Promise<ParsePdfResult>;
-
-const PDF_MIME_TYPE = "application/pdf";
-
-function deriveTitle(fileName: string): string {
-  const trimmed = fileName.trim();
-  const withoutExtension = trimmed.replace(/\.pdf$/i, "");
-  return withoutExtension.length > 0 ? withoutExtension : "Untitled PDF";
-}
-
-function isMongoDuplicateKeyError(err: unknown): boolean {
-  if (typeof err !== "object" || err === null) return false;
-  const candidate = err as { code?: number; name?: string };
-  return candidate.code === 11000 || candidate.name === "MongoServerError";
+function titleFromFilename(filename: string): string {
+  return filename.replace(/\.pdf$/i, "").trim() || filename;
 }
 
 export class LibraryService {
   constructor(
-    private readonly libraryRepo: LibraryRepo,
     private readonly config: LibraryConfig,
-    private readonly clock: () => Date,
-    private readonly parsePdf: ParsePdf,
+    private readonly repo: LibraryRepo,
+    private readonly pdfParser: PdfParser,
   ) {}
 
-  public async ensureDefaultLibrary(userId: string): Promise<LibraryDto> {
-    const library = await this.findOrCreateDefaultLibrary(userId);
-    return toLibraryDto(library);
-  }
+  async uploadArtifact(userId: string, buffer: Buffer, filename: string): Promise<ArtifactDto> {
+    const byteSize = buffer.length;
 
-  public async listArtifacts(userId: string): Promise<ArtifactDto[]> {
-    const library = await this.findOrCreateDefaultLibrary(userId);
-    const artifacts = await this.libraryRepo.listArtifactsForLibrary(userId, library.id);
-    return artifacts
-      .filter((a) => a.uploadStatus !== "removed")
-      .sort((a, b) => b.uploadedAt.getTime() - a.uploadedAt.getTime())
-      .map(toArtifactDto);
-  }
+    if (byteSize < MIN_UPLOAD_BYTES) throw new FileTooSmallError();
+    if (byteSize > this.config.maxUploadBytes) throw new FileTooLargeError();
+    if (!isPdf(buffer)) throw new InvalidFileTypeError();
 
-  public async uploadArtifact(request: UploadArtifactRequest): Promise<ArtifactDto> {
-    this.assertSize(request.file.byteLength);
-    this.assertPdfMagicBytes(request.file);
+    const sha256Hash = createHash("sha256").update(buffer).digest("hex");
+    const library = await this.repo.findOrCreateDefaultLibrary(userId);
 
-    const library = await this.findOrCreateDefaultLibrary(request.userId);
-    const sha256Hash = createHash("sha256").update(request.file).digest("hex");
+    const existing = await this.repo.findArtifactByHash(userId, library.id, sha256Hash);
+    if (existing) throw new DuplicateArtifactError();
 
-    const existingDuplicate = await this.libraryRepo.findArtifactByHash(
-      request.userId,
-      library.id,
-      sha256Hash,
-    );
-    if (existingDuplicate) {
-      throw new DuplicateArtifactError();
-    }
+    const storageUri = await this.repo.storeFile(buffer, filename, "application/pdf");
 
-    const now = this.clock();
-    const artifactId = randomUUID();
-
-    let inserted: Artifact;
-    try {
-      inserted = await this.libraryRepo.addArtifactToLibrary(request.userId, {
-        artifactId,
-        libraryId: library.id,
-        title: deriveTitle(request.fileName),
-        kind: "pdf",
-        uploadStatus: "processing",
-        byteSize: request.file.byteLength,
-        mimeType: PDF_MIME_TYPE,
+    const now = new Date();
+    const artifact: Artifact = {
+      id: crypto.randomUUID(),
+      libraryId: library.id,
+      title: titleFromFilename(filename),
+      kind: "pdf",
+      uploadStatus: "processing",
+      sourceFile: {
+        storageUri,
+        byteSize,
+        mimeType: "application/pdf",
         sha256Hash,
-        uploadedAt: now,
-        binary: request.file,
-      });
-    } catch (err) {
-      if (isMongoDuplicateKeyError(err)) {
-        throw new DuplicateArtifactError();
-      }
-      throw err;
-    }
-
-    try {
-      const { pageCount } = await this.parsePdf(request.file);
-      if (!Number.isInteger(pageCount) || pageCount < 1) {
-        throw new PdfParseError("PDF page count is invalid");
-      }
-      const processedAt = this.clock();
-      const ready = await this.libraryRepo.updateArtifactStatus(
-        request.userId,
-        library.id,
-        inserted.id,
-        {
-          uploadStatus: "ready",
-          pageCount,
-          processedAt,
-          updatedAt: processedAt,
-        },
-      );
-      return toArtifactDto(ready);
-    } catch (err) {
-      await this.rollbackFailedArtifact(request.userId, library.id, inserted.id);
-      if (err instanceof PdfParseError) throw err;
-      throw new PdfParseError();
-    }
-  }
-
-  public async getArtifactBinary(userId: string, artifactId: string): Promise<ArtifactBinaryDto> {
-    const library = await this.findOrCreateDefaultLibrary(userId);
-    const artifact = await this.libraryRepo.getArtifactById(userId, library.id, artifactId);
-    if (!artifact) {
-      throw new ArtifactNotFoundError();
-    }
-    const handle = await this.libraryRepo.openArtifactBinary(userId, library.id, artifactId);
-    if (!handle) {
-      throw new ArtifactNotFoundError();
-    }
-    return {
-      stream: handle.stream,
-      byteSize: handle.byteSize,
-      mimeType: handle.mimeType,
-      fileName: `${artifact.title}.pdf`,
-    };
-  }
-
-  public async removeArtifact(userId: string, artifactId: string): Promise<void> {
-    const library = await this.findOrCreateDefaultLibrary(userId);
-    const existing = await this.libraryRepo.getArtifactById(userId, library.id, artifactId);
-    if (!existing) {
-      throw new ArtifactNotFoundError();
-    }
-    await this.libraryRepo.removeArtifact(userId, library.id, artifactId);
-  }
-
-  private async findOrCreateDefaultLibrary(userId: string): Promise<Library> {
-    const existing = await this.libraryRepo.listLibrariesForUser(userId);
-    const active = existing.find((library) => library.isActive);
-    if (active) {
-      return active;
-    }
-    const now = this.clock();
-    const library: Library = {
-      id: randomUUID(),
-      userId,
-      name: this.config.defaultLibraryName,
-      isActive: true,
+      },
+      uploadedAt: now,
       createdAt: now,
       updatedAt: now,
     };
-    try {
-      return await this.libraryRepo.saveLibrary(library);
-    } catch (err) {
-      if (isMongoDuplicateKeyError(err)) {
-        const retry = await this.libraryRepo.listLibrariesForUser(userId);
-        const concurrent = retry.find((other) => other.isActive);
-        if (concurrent) return concurrent;
-      }
-      throw err;
-    }
-  }
 
-  private async rollbackFailedArtifact(
-    userId: string,
-    libraryId: string,
-    artifactId: string,
-  ): Promise<void> {
+    const saved = await this.repo.addArtifactToLibrary(userId, library.id, artifact);
+
     try {
-      await this.libraryRepo.removeArtifact(userId, libraryId, artifactId);
+      const pageCount = await this.pdfParser.getPageCount(buffer);
+      const processedAt = new Date();
+      await this.repo.updateArtifactStatus(userId, library.id, saved.id, "ready", { pageCount, processedAt });
+      return toArtifactDto({ ...artifact, uploadStatus: "ready", pageCount, processedAt });
     } catch {
-      // Best-effort cleanup; the upload pipeline already failed.
+      await this.repo.deleteFile(storageUri);
+      await this.repo.updateArtifactStatus(userId, library.id, saved.id, "failed");
+      throw new InvalidFileTypeError("Could not parse PDF content");
     }
   }
 
-  private assertSize(byteLength: number): void {
-    if (byteLength < this.config.minByteSize) {
-      throw new FileTooSmallError(this.config.minByteSize);
-    }
-    if (byteLength > this.config.maxByteSize) {
-      throw new FileTooLargeError(this.config.maxByteSize);
-    }
+  async listArtifacts(userId: string): Promise<ArtifactDto[]> {
+    const library = await this.repo.findOrCreateDefaultLibrary(userId);
+    const artifacts = await this.repo.listArtifactsForLibrary(userId, library.id);
+    return artifacts.map(toArtifactDto);
   }
 
-  /**
-   * PDF 1.7 §7.5.2 — every PDF file begins with the 5-byte sequence "%PDF-".
-   * We sniff server-side rather than trusting the browser-supplied mime type.
-   */
-  private assertPdfMagicBytes(buffer: Buffer): void {
-    if (buffer.byteLength < 5) {
-      throw new InvalidPdfError();
-    }
-    if (buffer.subarray(0, 5).toString("ascii") !== "%PDF-") {
-      throw new InvalidPdfError();
-    }
+  async getArtifactFile(
+    userId: string,
+    artifactId: string,
+  ): Promise<{ buffer: Buffer; mimeType: string; filename: string }> {
+    const library = await this.repo.findOrCreateDefaultLibrary(userId);
+    const artifact = await this.repo.getArtifactById(userId, library.id, artifactId);
+    if (!artifact) throw new ArtifactNotFoundError();
+
+    const buffer = await this.repo.readFile(artifact.sourceFile.storageUri);
+    return { buffer, mimeType: "application/pdf", filename: artifact.title };
+  }
+
+  async deleteArtifact(userId: string, artifactId: string): Promise<void> {
+    const library = await this.repo.findOrCreateDefaultLibrary(userId);
+    const artifact = await this.repo.getArtifactById(userId, library.id, artifactId);
+    if (!artifact) throw new ArtifactNotFoundError();
+
+    await this.repo.deleteFile(artifact.sourceFile.storageUri);
+    await this.repo.updateArtifactStatus(userId, library.id, artifactId, "removed");
   }
 }
