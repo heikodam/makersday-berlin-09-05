@@ -1,43 +1,50 @@
 export function Sidebar(): React.JSX.Element {
   return (
-    <nav className="hidden md:flex flex-col p-md gap-base border-r border-outline-variant bg-surface-container-low fixed left-0 top-0 h-screen w-[280px] z-50">
-      <div className="mb-xl flex items-center gap-sm">
-        <div className="w-10 h-10 rounded-lg bg-primary flex items-center justify-center text-on-primary">
-          <span className="material-symbols-outlined text-title-sm">auto_stories</span>
+    <aside className="w-[220px] flex-shrink-0 bg-surface-container-lowest border-r border-outline-variant flex flex-col py-md px-sm gap-xs">
+      <div className="flex items-center gap-sm px-sm py-xs mb-md">
+        <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center text-on-primary">
+          <span className="material-symbols-outlined text-[18px]" aria-hidden="true" style={{ fontVariationSettings: "'FILL' 1" }}>
+            auto_stories
+          </span>
         </div>
         <div>
-          <h1 className="text-title-sm font-title-sm font-bold text-primary m-0">Scholastic AI</h1>
-          <p className="text-body-sm font-body-sm text-on-surface-variant m-0">Digital Library</p>
+          <p className="text-title-sm font-title-sm text-on-surface m-0 leading-tight">Scholastic AI</p>
+          <p className="text-body-sm font-body-sm text-on-surface-variant m-0 text-[11px]">Digital Library</p>
         </div>
       </div>
-      <div className="flex flex-col gap-xs flex-1">
+
+      <nav className="flex flex-col gap-xs">
         <a
-          className="flex items-center gap-sm p-sm bg-secondary-container text-on-secondary-container rounded-lg hover:bg-secondary-container/80 transition-all"
           href="/library"
+          className="flex items-center gap-sm px-sm py-xs rounded-lg bg-secondary-container text-on-secondary-container text-body-md font-body-md"
           aria-current="page"
         >
-          <span className="material-symbols-outlined">menu_book</span>
-          <span className="text-label-caps font-label-caps">Library</span>
+          <span className="material-symbols-outlined text-[20px]" aria-hidden="true" style={{ fontVariationSettings: "'FILL' 1" }}>
+            local_library
+          </span>
+          Library
         </a>
+
         <a
-          className="flex items-center gap-sm p-sm text-on-surface-variant rounded-lg hover:bg-surface-container-high transition-all"
           href="#"
+          className="flex items-center gap-sm px-sm py-xs rounded-lg text-on-surface-variant text-body-md font-body-md opacity-40 cursor-not-allowed"
           aria-disabled="true"
           tabIndex={-1}
         >
-          <span className="material-symbols-outlined">forum</span>
-          <span className="text-label-caps font-label-caps">Chat</span>
+          <span className="material-symbols-outlined text-[20px]" aria-hidden="true">chat</span>
+          Chat
         </a>
+
         <a
-          className="flex items-center gap-sm p-sm text-on-surface-variant rounded-lg hover:bg-surface-container-high transition-all"
           href="#"
+          className="flex items-center gap-sm px-sm py-xs rounded-lg text-on-surface-variant text-body-md font-body-md opacity-40 cursor-not-allowed"
           aria-disabled="true"
           tabIndex={-1}
         >
-          <span className="material-symbols-outlined">history</span>
-          <span className="text-label-caps font-label-caps">History</span>
+          <span className="material-symbols-outlined text-[20px]" aria-hidden="true">history</span>
+          History
         </a>
-      </div>
-    </nav>
+      </nav>
+    </aside>
   );
 }

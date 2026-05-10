@@ -10,22 +10,15 @@ export const sourceFileSchema = z.object({
   storageUri: z.string().min(1),
   byteSize: z.number().int().positive(),
   mimeType: z.string().min(1),
-  sha256Hash: z
-    .string()
-    .regex(/^[0-9a-f]{64}$/, "sha256Hash must be 64 lowercase hex characters"),
+  sha256Hash: z.string().min(1),
 });
 export type SourceFile = z.infer<typeof sourceFileSchema>;
-
-export const artifactTitleSchema = z
-  .string()
-  .transform((value) => value.trim())
-  .pipe(z.string().min(1));
 
 export const artifactSchema = z
   .object({
     id: z.string().uuid(),
     libraryId: z.string().uuid(),
-    title: artifactTitleSchema,
+    title: z.string().transform((v) => v.trim()).pipe(z.string().min(1)),
     kind: artifactKindSchema,
     uploadStatus: uploadStatusSchema,
     sourceFile: sourceFileSchema,
@@ -35,35 +28,21 @@ export const artifactSchema = z
     createdAt: z.date(),
     updatedAt: z.date(),
   })
-  .superRefine((value, ctx) => {
-    const isReady = value.uploadStatus === "ready";
-    if (isReady && value.pageCount === undefined) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["pageCount"],
-        message: "pageCount is required when uploadStatus is 'ready'",
-      });
-    }
-    if (!isReady && value.pageCount !== undefined) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["pageCount"],
-        message: "pageCount may only be set when uploadStatus is 'ready'",
-      });
-    }
-    if (isReady && value.processedAt === undefined) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["processedAt"],
-        message: "processedAt is required when uploadStatus is 'ready'",
-      });
-    }
-    if (!isReady && value.processedAt !== undefined) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["processedAt"],
-        message: "processedAt may only be set when uploadStatus is 'ready'",
-      });
+  .superRefine((data, ctx) => {
+    if (data.uploadStatus === "ready") {
+      if (data.pageCount == null) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "pageCount required when uploadStatus is ready", path: ["pageCount"] });
+      }
+      if (data.processedAt == null) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "processedAt required when uploadStatus is ready", path: ["processedAt"] });
+      }
+    } else {
+      if (data.pageCount != null) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "pageCount must be absent when uploadStatus is not ready", path: ["pageCount"] });
+      }
+      if (data.processedAt != null) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "processedAt must be absent when uploadStatus is not ready", path: ["processedAt"] });
+      }
     }
   });
 

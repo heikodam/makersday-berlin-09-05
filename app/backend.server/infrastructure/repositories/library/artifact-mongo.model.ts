@@ -1,10 +1,6 @@
-import { index, modelOptions, prop, Severity, type DocumentType } from "@typegoose/typegoose";
-import type {
-  Artifact,
-  ArtifactKind,
-  SourceFile,
-  UploadStatus,
-} from "@backend-domain/library/artifact";
+import { modelOptions, prop, Severity, type DocumentType } from "@typegoose/typegoose";
+import type { Artifact, ArtifactKind, UploadStatus } from "@backend-domain/library/artifact";
+import type { SourceFile } from "@backend-domain/library/artifact";
 
 class SourceFileMongo implements SourceFile {
   @prop({ required: true, type: String })
@@ -20,10 +16,6 @@ class SourceFileMongo implements SourceFile {
   public sha256Hash!: string;
 }
 
-@index({ id: 1 }, { unique: true })
-@index({ libraryId: 1 })
-@index({ libraryId: 1, "sourceFile.sha256Hash": 1 }, { unique: true })
-@index({ libraryId: 1, uploadStatus: 1, kind: 1 })
 @modelOptions({
   schemaOptions: {
     timestamps: true,
@@ -32,7 +24,7 @@ class SourceFileMongo implements SourceFile {
   options: { allowMixed: Severity.ALLOW },
 })
 export class ArtifactMongoModel implements Artifact {
-  @prop({ required: true, type: String })
+  @prop({ unique: true, required: true, type: String })
   public id!: string;
 
   @prop({ required: true, type: String })

@@ -1,128 +1,71 @@
-import { useCallback } from "react";
-import { useNavigate, useRevalidator } from "react-router";
-import type { AuthenticatedUserDto } from "@backend-application/authentication/auth.dto";
-import type { ArtifactDto, LibraryDto } from "@backend-application/library/library.dto";
-import {
-  callDeleteArtifactApi,
-  getArtifactDownloadUrl,
-} from "~/routes/api/api.library.artifacts._sdk";
-import { callLogoutApi } from "~/routes/api/api.auth._sdk";
+import { useState } from "react";
+import { useRevalidator } from "react-router";
 import { Sidebar } from "./Sidebar";
 import { TopAppBar } from "./TopAppBar";
 import { UploadDropzone } from "./UploadDropzone";
-import { DocumentGrid } from "./DocumentGrid";
-import { useUploadArtifact } from "./hooks/use-upload-artifact";
-import { useDocumentToasts, type Toast } from "./hooks/use-document-toasts";
+import { DocumentGrid, type ArtifactSummary } from "./DocumentGrid";
+import { callUploadArtifactApi, callDeleteArtifactApi } from "~/routes/api/api.library.artifacts._sdk";
 
-export interface LibraryViewProps {
-  user: AuthenticatedUserDto;
-  library: LibraryDto;
-  artifacts: ArtifactDto[];
+interface LibraryViewProps {
+  artifacts: ArtifactSummary[];
 }
 
-export function LibraryView({ user, library, artifacts }: LibraryViewProps): React.JSX.Element {
-  const navigate = useNavigate();
+export function LibraryView({ artifacts }: LibraryViewProps): React.JSX.Element {
   const revalidator = useRevalidator();
-  const { isUploading, uploadFile } = useUploadArtifact();
-  const { toasts, pushToast, dismissToast } = useDocumentToasts();
+  const [isUploading, setIsUploading] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
 
-  const handleSignOut = useCallback(async (): Promise<void> => {
-    await callLogoutApi();
-    navigate("/login");
-  }, [navigate]);
+  async function handleFileSelected(file: File): Promise<void> {
+    setIsUploading(true);
+    setToast(null);
+    try {
+      await callUploadArtifactApi(file);
+      revalidator.revalidate();
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Upload failed");
+    } finally {
+      setIsUploading(false);
+    }
+  }
 
-  const handleFileSelected = useCallback(
-    async (file: File): Promise<void> => {
-      const result = await uploadFile(file);
-      if (result.ok) {
-        pushToast({ tone: "success", message: `Added “${result.artifact.title}” to your library.` });
-        return;
-      }
-      pushToast({ tone: "error", message: result.message });
-    },
-    [pushToast, uploadFile],
-  );
-
-  const handleOpen = useCallback((artifactId: string): void => {
-    window.open(getArtifactDownloadUrl(artifactId), "_blank", "noopener,noreferrer");
-  }, []);
-
-  const handleDelete = useCallback(
-    async (artifactId: string): Promise<void> => {
-      const ok = await callDeleteArtifactApi(artifactId);
-      if (ok) {
-        pushToast({ tone: "info", message: "Document removed." });
-        revalidator.revalidate();
-      } else {
-        pushToast({ tone: "error", message: "Could not delete the document." });
-      }
-    },
-    [pushToast, revalidator],
-  );
+  async function handleDelete(artifactId: string): Promise<void> {
+    try {
+      await callDeleteArtifactApi(artifactId);
+      revalidator.revalidate();
+    } catch {
+      setToast("Could not delete document");
+    }
+  }
 
   return (
-    <div className="bg-background text-on-background font-body-md min-h-screen flex">
+    <div className="flex min-h-screen bg-background">
       <Sidebar />
-      <div className="flex-1 md:ml-[280px] flex flex-col min-h-screen">
-        <TopAppBar user={user} onSignOut={handleSignOut} />
-        <main className="flex-1 p-gutter max-w-container-max mx-auto w-full flex flex-col gap-lg">
-          <UploadDropzone isUploading={isUploading} onFileSelected={handleFileSelected} />
 
-          <section>
-            <div className="flex justify-between items-end mb-md">
-              <h3 className="text-headline-md font-headline-md text-primary m-0">Recent Documents</h3>
-              <span className="text-label-caps font-label-caps text-on-surface-variant">
-                {library.name}
-              </span>
+      <div className="flex flex-col flex-1 min-w-0">
+        <TopAppBar />
+
+        <main className="flex-1 p-md flex flex-col gap-lg overflow-auto">
+          {toast ? (
+            <div
+              role="alert"
+              className="bg-error-container text-on-error-container text-body-sm font-body-sm rounded-lg px-md py-sm flex items-center justify-between"
+            >
+              {toast}
+              <button
+                type="button"
+                className="text-on-error-container opacity-60 hover:opacity-100"
+                onClick={() => setToast(null)}
+                aria-label="Dismiss"
+              >
+                <span className="material-symbols-outlined text-[18px]" aria-hidden="true">close</span>
+              </button>
             </div>
-            <DocumentGrid artifacts={artifacts} onOpen={handleOpen} onDelete={handleDelete} />
-          </section>
+          ) : null}
+
+          <UploadDropzone onFileSelected={handleFileSelected} isUploading={isUploading} />
+          <DocumentGrid artifacts={artifacts} onDelete={handleDelete} />
         </main>
       </div>
-
-      <ToastStack toasts={toasts} onDismiss={dismissToast} />
-    </div>
-  );
-}
-
-function ToastStack({
-  toasts,
-  onDismiss,
-}: {
-  toasts: Toast[];
-  onDismiss: (id: string) => void;
-}): React.JSX.Element | null {
-  if (toasts.length === 0) return null;
-  return (
-    <div
-      className="fixed bottom-md right-md flex flex-col gap-xs z-50"
-      role="region"
-      aria-live="polite"
-    >
-      {toasts.map((toast) => (
-        <div
-          key={toast.id}
-          role={toast.tone === "error" ? "alert" : "status"}
-          className={[
-            "flex items-start gap-sm p-sm rounded-lg shadow-md border max-w-sm",
-            toast.tone === "error"
-              ? "bg-error-container text-on-error-container border-error/30"
-              : toast.tone === "success"
-              ? "bg-secondary-container text-on-secondary-container border-secondary/30"
-              : "bg-surface-container-high text-on-surface border-outline-variant",
-          ].join(" ")}
-        >
-          <span className="text-body-sm font-body-sm flex-1 m-0">{toast.message}</span>
-          <button
-            type="button"
-            className="text-body-sm font-body-sm opacity-70 hover:opacity-100"
-            aria-label="Dismiss"
-            onClick={() => onDismiss(toast.id)}
-          >
-            <span className="material-symbols-outlined text-[16px]">close</span>
-          </button>
-        </div>
-      ))}
     </div>
   );
 }

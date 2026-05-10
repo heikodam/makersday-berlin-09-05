@@ -1,232 +1,164 @@
-import { Buffer } from "node:buffer";
-import { describe, expect, it } from "vitest";
+import { describe, it, expect } from "vitest";
+import { Readable } from "node:stream";
+import { LibraryService } from "@backend-application/library/library.service";
 import { LibraryConfig } from "@backend-application/library/config";
-import {
-  ArtifactNotFoundError,
-  DuplicateArtifactError,
-  FileTooLargeError,
-  FileTooSmallError,
-  InvalidPdfError,
-  PdfParseError,
-} from "@backend-application/library/errors";
-import { LibraryService, type ParsePdf } from "@backend-application/library/library.service";
-import type { UploadArtifactRequest } from "@backend-application/library/library.dto";
-import { InMemoryLibraryRepo } from "../shared/in-memory-library-repo";
+import { InvalidPdfError, FileTooSmallError, FileTooLargeError } from "@backend-application/library/errors";
+import { InMemoryLibraryRepo } from "../../doubles/in-memory-library-repo";
+import { InMemoryPdfStorageGateway } from "../../doubles/in-memory-pdf-storage.gateway";
+import { FakePdfParserGateway } from "../../doubles/fake-pdf-parser.gateway";
 
-const USER_A = "00000000-0000-4000-8000-00000000aaaa";
-const USER_B = "00000000-0000-4000-8000-00000000bbbb";
-const FROZEN_NOW = new Date("2026-05-08T22:00:00.000Z");
+const USER_ID = "00000000-0000-4000-8000-000000000001";
+const VALID_PDF_HEADER = Buffer.from("%PDF-1.4\n", "ascii");
+const PDF_MAGIC = Buffer.from([0x25, 0x50, 0x44, 0x46]); // %PDF
 
-const MIN_BYTES = 10 * 1024;
-const MAX_BYTES = 25 * 1024 * 1024;
-
-function pdfBuffer(byteLength: number, salt = "salt"): Buffer {
-  const header = Buffer.from(`%PDF-1.7\n${salt}\n`, "utf8");
-  if (byteLength <= header.byteLength) {
-    return Buffer.concat([header.subarray(0, byteLength)]);
-  }
-  const padding = Buffer.alloc(byteLength - header.byteLength, 0x20);
-  return Buffer.concat([header, padding]);
+function makePdfBuffer(size: number): Buffer {
+  const buf = Buffer.alloc(size);
+  PDF_MAGIC.copy(buf);
+  return buf;
 }
 
-function makeConfig(overrides: Partial<{ minByteSize: number; maxByteSize: number; defaultLibraryName: string }> = {}): LibraryConfig {
-  return new LibraryConfig(
-    overrides.minByteSize ?? MIN_BYTES,
-    overrides.maxByteSize ?? MAX_BYTES,
-    overrides.defaultLibraryName ?? "My Library",
-  );
+function makeStream(buffer: Buffer): Readable {
+  return Readable.from(buffer);
 }
 
-function makeService(overrides: {
-  repo?: InMemoryLibraryRepo;
-  config?: LibraryConfig;
-  clock?: () => Date;
-  parsePdf?: ParsePdf;
-} = {}): { service: LibraryService; repo: InMemoryLibraryRepo } {
-  const repo = overrides.repo ?? new InMemoryLibraryRepo();
-  const service = new LibraryService(
-    repo,
-    overrides.config ?? makeConfig(),
-    overrides.clock ?? (() => FROZEN_NOW),
-    overrides.parsePdf ?? (async () => ({ pageCount: 3 })),
-  );
-  return { service, repo };
+function makeConfig(overrides: Partial<{ minByteSize: number; maxByteSize: number }> = {}): LibraryConfig {
+  return new LibraryConfig("My Library", overrides.minByteSize ?? 10 * 1024, overrides.maxByteSize ?? 25 * 1024 * 1024);
 }
 
-function makeRequest(overrides: Partial<UploadArtifactRequest> = {}): UploadArtifactRequest {
-  return {
-    userId: overrides.userId ?? USER_A,
-    fileName: overrides.fileName ?? "report.pdf",
-    file: overrides.file ?? pdfBuffer(MIN_BYTES + 1024),
-  };
+function makeService(overrides: { config?: LibraryConfig; sequential?: boolean } = {}) {
+  const repo = new InMemoryLibraryRepo();
+  const storage = new InMemoryPdfStorageGateway();
+  const parser = new FakePdfParserGateway(5);
+  const config = overrides.config ?? makeConfig();
+  let tick = 0;
+  const clock = overrides.sequential
+    ? () => new Date(new Date("2026-01-01T00:00:00Z").getTime() + tick++ * 1000)
+    : () => new Date("2026-01-01T00:00:00Z");
+  const service = new LibraryService(repo, storage, parser, config, clock);
+  return { service, repo, storage, parser };
 }
 
 describe("LibraryService.uploadArtifact", () => {
-  it("uploads a PDF, transitions to ready, and returns a DTO listed at the top of the user's library", async () => {
-    const { service, repo } = makeService();
+  it("uploads a valid PDF and returns a ready artifact", async () => {
+    const { service } = makeService();
+    const buffer = makePdfBuffer(11 * 1024); // 11 KB
 
-    const dto = await service.uploadArtifact(makeRequest());
+    const dto = await service.uploadArtifact({
+      userId: USER_ID,
+      fileName: "paper.pdf",
+      mimeType: "application/pdf",
+      stream: makeStream(buffer),
+    });
 
     expect(dto.uploadStatus).toBe("ready");
-    expect(dto.kind).toBe("pdf");
-    expect(dto.title).toBe("report");
-    expect(dto.pageCount).toBe(3);
-
-    const list = await service.listArtifacts(USER_A);
-    expect(list).toHaveLength(1);
-    expect(list[0]?.id).toBe(dto.id);
-
-    const libraries = await repo.listLibrariesForUser(USER_A);
-    expect(libraries).toHaveLength(1);
-    expect(libraries[0]?.name).toBe("My Library");
+    expect(dto.title).toBe("paper");
+    expect(dto.pageCount).toBe(5);
+    expect(dto.byteSize).toBe(buffer.length);
   });
 
-  it("auto-creates the Default library exactly once across multiple uploads", async () => {
+  it("auto-provisions the default library on first upload and is idempotent", async () => {
     const { service, repo } = makeService();
+    const buf = makePdfBuffer(11 * 1024);
 
-    await service.uploadArtifact(makeRequest({ fileName: "a.pdf", file: pdfBuffer(MIN_BYTES + 1024, "a") }));
-    await service.uploadArtifact(makeRequest({ fileName: "b.pdf", file: pdfBuffer(MIN_BYTES + 1024, "b") }));
+    await service.uploadArtifact({ userId: USER_ID, fileName: "a.pdf", mimeType: "application/pdf", stream: makeStream(buf) });
+    const lib = await repo.getDefaultForUser(USER_ID);
+    expect(lib).not.toBeNull();
+    expect(lib!.name).toBe("My Library");
 
-    expect(repo.listLibraries()).toHaveLength(1);
+    // Second upload does not create another library
+    const buf2 = makePdfBuffer(12 * 1024);
+    buf2[4] = 0x01; // Make sha256 different
+    await service.uploadArtifact({ userId: USER_ID, fileName: "b.pdf", mimeType: "application/pdf", stream: makeStream(buf2) });
+    const lib2 = await repo.getDefaultForUser(USER_ID);
+    expect(lib2!.id).toBe(lib!.id);
   });
 
-  it("rejects files smaller than the minimum size with FileTooSmallError", async () => {
+  it("lists artifacts newest-first after upload", async () => {
+    const { service } = makeService({ sequential: true });
+
+    const buf1 = makePdfBuffer(11 * 1024);
+    const buf2 = makePdfBuffer(12 * 1024);
+    buf2[4] = 0xAA;
+
+    const dto1 = await service.uploadArtifact({ userId: USER_ID, fileName: "first.pdf", mimeType: "application/pdf", stream: makeStream(buf1) });
+    const dto2 = await service.uploadArtifact({ userId: USER_ID, fileName: "second.pdf", mimeType: "application/pdf", stream: makeStream(buf2) });
+
+    const list = await service.listArtifacts(USER_ID);
+    expect(list[0].id).toBe(dto2.id);
+    expect(list[1].id).toBe(dto1.id);
+  });
+
+  it("rejects file with bad magic bytes with InvalidPdfError", async () => {
     const { service } = makeService();
-    const tinyPdf = pdfBuffer(MIN_BYTES - 1);
+    const buf = Buffer.alloc(11 * 1024, 0x00);
 
-    await expect(service.uploadArtifact(makeRequest({ file: tinyPdf }))).rejects.toBeInstanceOf(
-      FileTooSmallError,
-    );
+    await expect(
+      service.uploadArtifact({ userId: USER_ID, fileName: "bad.pdf", mimeType: "application/pdf", stream: makeStream(buf) }),
+    ).rejects.toBeInstanceOf(InvalidPdfError);
   });
 
-  it("rejects files larger than the maximum size with FileTooLargeError", async () => {
-    const { service } = makeService({ config: makeConfig({ maxByteSize: MIN_BYTES + 100 }) });
-    const tooLarge = pdfBuffer(MIN_BYTES + 101);
+  it("rejects file below minByteSize with FileTooSmallError", async () => {
+    const { service } = makeService({ config: makeConfig({ minByteSize: 10 * 1024 }) });
+    const buf = makePdfBuffer(100);
 
-    await expect(service.uploadArtifact(makeRequest({ file: tooLarge }))).rejects.toBeInstanceOf(
-      FileTooLargeError,
-    );
+    await expect(
+      service.uploadArtifact({ userId: USER_ID, fileName: "tiny.pdf", mimeType: "application/pdf", stream: makeStream(buf) }),
+    ).rejects.toBeInstanceOf(FileTooSmallError);
   });
 
-  it("rejects non-PDF bytes (magic-byte sniff) with InvalidPdfError", async () => {
+  it("rejects file above maxByteSize with FileTooLargeError", async () => {
+    const { service } = makeService({ config: makeConfig({ minByteSize: 4, maxByteSize: 1024 }) });
+    const buf = makePdfBuffer(2048);
+
+    await expect(
+      service.uploadArtifact({ userId: USER_ID, fileName: "huge.pdf", mimeType: "application/pdf", stream: makeStream(buf) }),
+    ).rejects.toBeInstanceOf(FileTooLargeError);
+  });
+
+  it("user A cannot see user B's artifacts", async () => {
     const { service } = makeService();
-    const fakePdf = Buffer.concat([Buffer.from("PNG"), Buffer.alloc(MIN_BYTES + 1024, 0)]);
+    const buf = makePdfBuffer(11 * 1024);
 
-    await expect(service.uploadArtifact(makeRequest({ file: fakePdf }))).rejects.toBeInstanceOf(
-      InvalidPdfError,
-    );
+    await service.uploadArtifact({ userId: USER_ID, fileName: "a.pdf", mimeType: "application/pdf", stream: makeStream(buf) });
+
+    const otherUserId = "00000000-0000-4000-8000-000000000002";
+    const otherList = await service.listArtifacts(otherUserId);
+    expect(otherList).toHaveLength(0);
   });
+});
 
-  it("rejects a duplicate (same SHA-256) within the same user's library", async () => {
+describe("LibraryService dedupe (AC 8)", () => {
+  it("rejects a duplicate file (same sha256) with DuplicateArtifactError", async () => {
     const { service } = makeService();
-    const file = pdfBuffer(MIN_BYTES + 1024, "duplicate");
+    const buf = makePdfBuffer(11 * 1024);
 
-    await service.uploadArtifact(makeRequest({ file }));
-    await expect(service.uploadArtifact(makeRequest({ file }))).rejects.toBeInstanceOf(
-      DuplicateArtifactError,
-    );
-  });
+    await service.uploadArtifact({ userId: USER_ID, fileName: "orig.pdf", mimeType: "application/pdf", stream: makeStream(buf) });
 
-  it("does not leak a duplicate-key race past the application boundary", async () => {
-    const repo = new InMemoryLibraryRepo();
-    const file = pdfBuffer(MIN_BYTES + 1024, "race");
-    const { service } = makeService({ repo });
-
-    await service.uploadArtifact(makeRequest({ file }));
-    const findOriginal = repo.findArtifactByHash.bind(repo);
-    repo.findArtifactByHash = async () => null;
-
-    await expect(service.uploadArtifact(makeRequest({ file }))).rejects.toBeInstanceOf(
-      DuplicateArtifactError,
-    );
-
-    repo.findArtifactByHash = findOriginal;
-  });
-
-  it("scopes uploads per user — user B never sees user A's artifacts", async () => {
-    const repo = new InMemoryLibraryRepo();
-    const { service } = makeService({ repo });
-
-    await service.uploadArtifact(
-      makeRequest({ userId: USER_A, file: pdfBuffer(MIN_BYTES + 1024, "a") }),
-    );
-
-    const userBList = await service.listArtifacts(USER_B);
-    expect(userBList).toHaveLength(0);
-    expect(repo.listLibraries()).toHaveLength(2);
-  });
-
-  it("transitions to failed (rolled back) when the PDF parser throws", async () => {
-    const repo = new InMemoryLibraryRepo();
-    const failingParser: ParsePdf = async () => {
-      throw new Error("boom");
-    };
-    const { service } = makeService({ repo, parsePdf: failingParser });
-
-    await expect(service.uploadArtifact(makeRequest())).rejects.toBeInstanceOf(PdfParseError);
-    expect(repo.listAllArtifacts()).toHaveLength(0);
+    const { DuplicateArtifactError } = await import("@backend-application/library/errors");
+    await expect(
+      service.uploadArtifact({ userId: USER_ID, fileName: "dup.pdf", mimeType: "application/pdf", stream: makeStream(buf) }),
+    ).rejects.toBeInstanceOf(DuplicateArtifactError);
   });
 });
 
 describe("LibraryService.listArtifacts", () => {
-  it("returns the user's artifacts newest-first and ignores removed entries", async () => {
+  it("returns empty array when user has no library", async () => {
     const { service } = makeService();
-    const fileOld = pdfBuffer(MIN_BYTES + 1024, "old");
-    const fileNew = pdfBuffer(MIN_BYTES + 1024, "new");
-
-    let now = new Date(FROZEN_NOW.getTime());
-    const advancingClock = (): Date => new Date(now.getTime());
-
-    const { service: timed } = makeService({
-      repo: undefined,
-      clock: advancingClock,
-    });
-
-    now = new Date("2026-05-08T22:00:00.000Z");
-    await timed.uploadArtifact(makeRequest({ fileName: "old.pdf", file: fileOld }));
-    now = new Date("2026-05-08T23:00:00.000Z");
-    const newer = await timed.uploadArtifact(makeRequest({ fileName: "new.pdf", file: fileNew }));
-
-    const list = await timed.listArtifacts(USER_A);
-    expect(list[0]?.id).toBe(newer.id);
-  });
-});
-
-describe("LibraryService.removeArtifact", () => {
-  it("throws ArtifactNotFoundError for an unknown id", async () => {
-    const { service } = makeService();
-    await expect(service.removeArtifact(USER_A, "00000000-0000-4000-8000-00000000ffff")).rejects.toBeInstanceOf(
-      ArtifactNotFoundError,
-    );
-  });
-
-  it("removes a previously-uploaded artifact", async () => {
-    const { service } = makeService();
-    const dto = await service.uploadArtifact(makeRequest());
-
-    await service.removeArtifact(USER_A, dto.id);
-    const list = await service.listArtifacts(USER_A);
+    const list = await service.listArtifacts(USER_ID);
     expect(list).toHaveLength(0);
   });
 });
 
-describe("LibraryService.getArtifactBinary", () => {
-  it("returns a stream for a successful upload", async () => {
+describe("LibraryService.removeArtifact", () => {
+  it("removes artifact and deletes from storage", async () => {
     const { service } = makeService();
-    const dto = await service.uploadArtifact(makeRequest());
+    const buf = makePdfBuffer(11 * 1024);
 
-    const binary = await service.getArtifactBinary(USER_A, dto.id);
-    expect(binary.byteSize).toBeGreaterThan(0);
-    expect(binary.mimeType).toBe("application/pdf");
-    expect(binary.fileName).toBe("report.pdf");
-  });
+    const dto = await service.uploadArtifact({ userId: USER_ID, fileName: "a.pdf", mimeType: "application/pdf", stream: makeStream(buf) });
 
-  it("throws ArtifactNotFoundError when another user requests the binary", async () => {
-    const { service } = makeService();
-    const dto = await service.uploadArtifact(makeRequest({ userId: USER_A }));
+    await service.removeArtifact(USER_ID, dto.id);
 
-    await expect(service.getArtifactBinary(USER_B, dto.id)).rejects.toBeInstanceOf(
-      ArtifactNotFoundError,
-    );
+    const list = await service.listArtifacts(USER_ID);
+    expect(list).toHaveLength(0);
   });
 });

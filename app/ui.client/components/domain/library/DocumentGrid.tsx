@@ -1,33 +1,38 @@
-import type { ArtifactDto } from "@backend-application/library/library.dto";
 import { DocumentCard } from "./DocumentCard";
 
-export interface DocumentGridProps {
-  artifacts: ArtifactDto[];
-  onOpen: (artifactId: string) => void;
-  onDelete: (artifactId: string) => void;
+export interface ArtifactSummary {
+  id: string;
+  title: string;
+  kind: string;
+  uploadedAt: string;
 }
 
-export function DocumentGrid({ artifacts, onOpen, onDelete }: DocumentGridProps): React.JSX.Element {
-  if (artifacts.length === 0) {
-    return (
-      <div className="bg-surface-container-low rounded-lg border border-dashed border-outline-variant p-xl text-center">
-        <p className="text-body-md font-body-md text-on-surface-variant m-0">
-          No documents yet. Drop a PDF above to get started.
-        </p>
-      </div>
-    );
-  }
+interface DocumentGridProps {
+  artifacts: ArtifactSummary[];
+  onDelete?: (id: string) => void;
+}
 
+export function DocumentGrid({ artifacts, onDelete }: DocumentGridProps): React.JSX.Element {
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-gutter">
-      {artifacts.map((artifact) => (
-        <DocumentCard
-          key={artifact.id}
-          artifact={artifact}
-          onOpen={onOpen}
-          onDelete={onDelete}
-        />
-      ))}
-    </div>
+    <section>
+      <div className="flex items-center justify-between mb-md">
+        <h2 className="text-title-sm font-title-sm text-on-surface m-0">Recent Documents</h2>
+        {artifacts.length > 0 && (
+          <a href="#" className="text-body-sm font-body-sm text-secondary">
+            View All →
+          </a>
+        )}
+      </div>
+
+      {artifacts.length === 0 ? (
+        <p className="text-body-sm font-body-sm text-on-surface-variant">No documents yet.</p>
+      ) : (
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-md">
+          {artifacts.map((artifact) => (
+            <DocumentCard key={artifact.id} artifact={artifact} onDelete={onDelete} />
+          ))}
+        </div>
+      )}
+    </section>
   );
 }

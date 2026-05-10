@@ -1,61 +1,73 @@
-# GR-002 — Library PDF Upload & Browse — Planning + Build Summary
+# GR-002 — Planning Session Summary
 
-## Key decisions
+This document captures the decisions, debates, and rationale that produced `plan.md`. It exists so the Coding Agent can pick up the plan with full context — what we explored, what we rejected, and why.
 
-### 1. Domain shape (Option A)
-We chose to implement the **full harness `library` aggregate** — `Library` aggregate root with `Artifact` internal entity persisted across two collections (`libraries`, `artifacts`) — even though the user-facing UX in v1 only ever shows a single Default library per user. The repo and service support multi-library; `LibraryService.uploadArtifact` simply auto-provisions a single `"My Library"` library on first call (`findOrCreateDefaultLibrary`), and `/library` renders that library's artifacts. This costs us almost nothing today and saves a future migration when multi-library UX lands.
+## Context
 
-### 2. Storage (Option B — direct GridFS)
-The harness manifesto recommends the "external capabilities behind a port" pattern (e.g. `pdf-storage.gateway.ts`). For GR-002 we deliberately diverged: a thin `gridfs-bucket.ts` wrapper in `platform/infrastructure/mongo/` is consumed directly by `LibraryMongoRepo`. The domain keeps `SourceFile.storageUri` opaque; the repo is the only place that parses the canonical `gridfs://<ObjectId>` scheme. If/when storage choice changes (e.g. S3, signed URLs), only the repo changes and the URI scheme is the contract.
+GR-002 (Library PDF upload + browse) had a prior implementation that was deliberately reverted in commit `948bb2a` to give workshop participants a clean reset. The user (`sneharao`) explicitly chose **not** to reproduce the prior plan, so this session re-derived the architectural decisions through a persona panel rather than copying forward.
 
-### 3. PDF parsing is injected, not imported by the service
-`LibraryService` is constructed with `parsePdf: (Buffer) => Promise<{ pageCount }>` as its fourth dependency. The default implementation in `infrastructure/gateways/library/pdf-parse.adapter.ts` wraps `pdf-parse` (v2 class API: `new PDFParse(...)` + `getInfo().total`). This keeps the application ring free of the parser dependency and lets unit tests inject a deterministic stub.
+The pre-session state of the repo:
 
-### 4. Status transitions are synchronous
-We do **not** introduce a worker or queue. `LibraryService.uploadArtifact` flows: `findOrCreateDefaultLibrary` → SHA-256 → common-case dedupe lookup → `addArtifactToLibrary` (status `processing`, GridFS write) → `parsePdf` → `updateArtifactStatus` (status `ready` with `pageCount` + `processedAt`). On parser failure, we roll back via `removeArtifact` (deletes both the artifact doc and its GridFS chunks) and surface `PdfParseError`.
+- GR-001 (auth + session cookie) shipped. `User` aggregate, demo login, `enforceAuth` middleware, `/library` placeholder behind auth.
+- No `library` bounded-context code exists in the repo. The harness `library` domain knowledge (`harness/knowledge/domain/library/{domain-model,data-model,language}.md`) describes the target model.
+- The reverted prior plan is recoverable via `git show 948bb2a^:harness/exec-plans/001-gr_002-library-pdf-upload/plan.md` — used as reference, not blueprint.
 
-### 5. Multipart uploads stream through `busboy`
-We bypass React Router 7's `unstable_parseMultipartFormData` (which materialises files in memory) and pipe `Readable.fromWeb(request.body)` into `busboy`, with a hard `limits.fileSize = maxByteSize + 1` guard. Magic-byte sniff (`%PDF-`) happens inside `LibraryService.uploadArtifact` (8-byte buffer check, PDF 1.7 §7.5.2) so the controller stays thin and the rule lives next to the size guards.
+## Persona panel
 
-### 6. Race-safe dedupe
-Two-layer defence: (1) common-case `findArtifactByHash` lookup short-circuits before GridFS write, (2) the `(libraryId, sourceFile.sha256Hash)` unique index in `artifacts` catches the rare race; the service catches Mongo `code: 11000` and re-throws as `DuplicateArtifactError`. The `library-mongo.repo.ts` adapter cleans up the orphaned GridFS file in the `addArtifactToLibrary` catch block.
+Convened **Cockburn (ports/adapters), Evans (DDD), Beck (TDD), Cagan (product engineering)** to break open the architectural decisions the prior plan deliberately deferred. Key tensions surfaced:
 
-### 7. Naming aligns with the harness, not the ticket
-The original ticket described snake_case fields and a single `documents` collection. We updated `jira-tickets/todo/gr_002_library_pdf_upload.md` to use harness terminology — `userId`, `libraryId`, `sourceFile.sha256Hash` (camelCase), two collections, `Library` / `Artifact` — so future tickets and code reviews share the same vocabulary.
+- **Cockburn vs Cagan on storage port.** Cockburn diagnosed `LibraryMongoRepo` doing two driven-side jobs at once (Mongo persistence + GridFS blob storage) as a missing port. Cagan would normally call this premature, but the prior plan had explicitly flagged it as a manifesto divergence — the workshop reset is the moment to fix it. **Resolved in Cockburn's favour.**
+- **Beck vs Cagan on test strategy.** Beck pushed for real-Mongo coverage of AC 8 (unique-index race) and AC 10 (GridFS cleanup) — an in-memory repo that fakes `code: 11000` is not the same as the real index. Cagan pushed back on preemptively wrapping everything. **Resolved as hybrid:** add `mongodb-memory-server` but only where it catches real bugs (slices 2, 4, 5).
+- **Evans vs Cagan on aggregate shape.** Evans insisted the full `Library` aggregate is non-negotiable — GR-003 citations resolve `(libraryId, artifactId)` and need the model coherent before chat lands. Cagan agreed since v1 UX still hides multi-library; the model and the UX are decoupled. **Resolved trivially.**
+
+The panel synthesis became the basis for the decisions table in `plan.md` §2.
+
+## Critique triage
+
+Self-critique ran per `harness/skills/planning/critique-coding-plan.md`. Seven issues raised; the user accepted all seven:
+
+| # | Area | Outcome |
+|---|---|---|
+| 1 | Gaps & blind spots: slice 2 had no real-Mongo coverage | **Accepted.** `mongodb-memory-server` setup pulled into slice 2 with one happy-path round-trip integration test. |
+| 2 | Robustness: SHA-256 inside the storage adapter couples the protocol to the storage choice | **Accepted.** Hashing moved to `LibraryService`. `PdfStorageGateway.putPdf(buffer)` returns just `{ storageUri }`. Storage adapter is now purely bytes-in/bytes-out. |
+| 3 | Simplicity: validation spread across three layers | **Accepted.** `Content-Length` in controller (transport), magic-byte + min/max-size in service (domain), nothing in adapter. |
+| 4 | Testability: slice 1 had zero automated tests | **Accepted** (over my recommendation to defer). `@testing-library/react` + `jsdom` + a single render test for `LibraryView` lands in slice 1. Per-file vitest environment switch (`jsdom` for `.test.tsx`, `node` for backend tests). |
+| 5 | Consistency: plan assumed `app/shared/` exists; it doesn't | **Accepted.** Inline schemas in `api.library.artifacts._sdk.ts` (matches `api.auth._sdk.ts`). `app/shared/` is deferred until GR-003 actually needs cross-process types. |
+| 6 | Maintainability: `LibraryService` grows to 5 public methods | **Accepted (no action now).** Re-evaluate after GR-003. Split if it crosses ~400 lines or grows a sixth method. |
+| 7 | Design: URI-scheme narrative still pointed at the repo | **Accepted.** After fixing #2, the GridFS adapter (not the repo) is the only file that parses `gridfs://`. Documented in the adapter's header. |
 
 ## Things deliberately NOT done
 
-- **Repository integration tests against a real MongoDB.** The plan listed them as ideal coverage for AC 8 (unique-index race) and AC 10 (GridFS round-trip), but the existing test setup has no Mongo container wiring. The in-memory `InMemoryLibraryRepo` mirrors the unique-index semantics (`code: 11000`) and the application unit tests cover the same paths. A follow-up ticket should add a docker-compose-backed integration test harness.
-- **Controller integration tests.** Same reason — multipart parsing through `busboy` is exercised manually via the live route during development; a fully isolated controller test would need to fabricate `Request` objects with multipart bodies, which is plumbing-heavy.
-- **PDF thumbnails / cover extraction.** Out of scope for v1 per the ticket.
-- **Multi-library UX.** Out of scope for v1 per the ticket.
-- **Search wiring.** The search input is rendered `disabled`.
+- **Reuse the prior plan verbatim.** The user explicitly rejected this. The new plan converges on similar overall structure (the harness domain model dictates much of it) but differs materially on the gateway-port shape, hashing location, validation layering, and test strategy.
+- **Build a `pdf-storage.gateway.ts` against S3 yet.** Only the GridFS adapter ships in v1 — but the port shape is general enough that swapping is local to `application.instances.ts` plus a new adapter file.
+- **Streaming SHA-256 transform.** Service buffers the full upload (≤ 25 MB cap). A streaming transform is cheap to add later if the cap rises; not worth the complexity now (Beck: simplest first).
+- **Controller integration tests.** High plumbing cost (fabricating multipart `Request` objects), low marginal value over the app-service tests + the live route during development. Would land in a future hardening ticket.
+- **Multi-library UX, thumbnails, kind classification, async pipeline, search wiring, batch upload UI.** Out of scope per ticket §"Out of scope" and confirmed by the panel.
 
-## Files added
+## Settled answers to the open questions
 
-- `app/backend.server/domain/library/{library.ts,artifact.ts,library.repo.ts}` — domain entities + Zod schemas + repo port.
-- `app/backend.server/application/library/{library.service.ts,library.dto.ts,errors.ts,config.ts}` — application use cases.
-- `app/backend.server/platform/infrastructure/mongo/gridfs-bucket.ts` — GridFS wrapper.
-- `app/backend.server/infrastructure/repositories/library/{library-mongo.model.ts,artifact-mongo.model.ts,library-mongo.repo.ts}` — Mongo adapter.
-- `app/backend.server/infrastructure/api/library/{library.controller.ts,multipart.ts}` — controller + busboy multipart parser.
-- `app/backend.server/infrastructure/gateways/library/pdf-parse.adapter.ts` — `pdf-parse` adapter.
-- `app/routes/api/api.library.artifacts.{upload,_sdk}.ts`, `api.library.artifacts.ts`, `api.library.artifacts.$artifactId.ts` — API routes + client SDK.
-- `app/ui.client/components/domain/library/{LibraryView,Sidebar,TopAppBar,UploadDropzone,DocumentGrid,DocumentCard}.tsx` — UI components.
-- `app/ui.client/components/domain/library/hooks/{use-upload-artifact,use-document-toasts}.ts` — UI hooks.
-- `tests/backend.server/application/{shared/in-memory-library-repo.ts,library/library.service.test.ts}` — application tests + in-memory repo (29 tests).
+The plan asked the user three open questions during the collaborative session:
 
-## Files modified
+1. **Time-box.** "Production trajectory — let the plan stand." → No slice cuts; `mongodb-memory-server` integration tests stay.
+2. **Branch / reviewer.** Initially proposed `feature/sr-002-library-pdf-upload` + reviewer `marduSwanepoel`. The branch name violated `harness/knowledge/code-standards/branch-naming.md` (use `feat/`, no ticket numbers, 3–5 word desc). User chose option **A — `feat/library-pdf-upload`** (convention-compliant). Reviewer confirmed `marduSwanepoel`.
+3. **Ship mid-slice.** "All 5 must land." → The PR stays open until slice 5 is done; no early merge.
 
-- `app/backend.server/main/{run-config.ts,application.instances.ts,controller.instances.ts}` — wired in `LibraryConfig`, `LibraryMongoRepo`, `LibraryService`, `LibraryController`.
-- `app/routes/pages/library.tsx` — replaced welcome placeholder with the real loader + `LibraryView`.
-- `jira-tickets/todo/gr_002_library_pdf_upload.md` — aligned wording with the harness domain model.
-- `harness/knowledge/domain/library/data-model.md` — documented v1 single-default-library + `gridfs://` URI scheme.
-- `.env.example` — documented optional `LIBRARY_*` overrides.
-- `package.json` — added `busboy`, `pdf-parse`, `uuid` (and types).
+## Files this plan will produce
 
-## Verification
+`plan.md` §3 lists every file. Summary:
 
-- `npm run typecheck` passes.
-- `npm run test` — 38 tests pass (29 new for `LibraryService`, 9 pre-existing for auth).
-- `npm run build` — production build succeeds.
-- Manual smoke pending against `designs/library_scholastic_ai/screen.png` (sidebar 280 px, header 64 px, dashed dropzone, 1/2/3/4-col grid).
+- 3 domain files (`library.ts`, `artifact.ts`, `library.repo.ts`).
+- 5 application files (`library.service.ts`, `library.dto.ts`, `errors.ts`, `config.ts`, plus 2 gateway ports `pdf-storage.gateway.ts` / `pdf-parser.gateway.ts`).
+- 5 infrastructure files (2 Typegoose models, 1 repo adapter, 2 gateway adapters).
+- 2 controller files (`library.controller.ts`, `multipart.ts`).
+- 4 route files (`api.library.artifacts.{ts, upload.ts, $artifactId.ts, _sdk.ts}`).
+- 6 UI files (`LibraryView`, `Sidebar`, `TopAppBar`, `UploadDropzone`, `DocumentGrid`, `DocumentCard`) + 2 hooks.
+- 8 test files (1 jsdom render, 1 app-service unit, 1 repo integration, 4 in-memory doubles, 1 vitest setup).
+- 5 modified composition/wiring/config files (`run-config.ts`, `application.instances.ts`, `controller.instances.ts`, `routes/pages/library.tsx`, `package.json`, `.env.example`, `vitest.config.ts`).
+- 1 modified harness knowledge file (`infra/infrastructure.md` — register the two new gateway integrations).
+
+## Verification plan
+
+- Per-slice: `npm run typecheck` and `npm run test` clean before commit.
+- After slice 5: full `npm run build`, manual smoke against `designs/library_scholastic_ai/screen.png` for ACs 1–3, end-to-end click-through (login → drop PDF → see card → reload → still there → delete → gone).
+- PR description includes screenshots of the empty state, populated state, and validation toasts.

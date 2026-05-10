@@ -18,8 +18,6 @@ The persistence layer faithfully serialises the single aggregate root defined in
 - **Soft delete:** `Library` carries `isActive: boolean` (default `true`). `Artifact` does not carry `isActive`; its lifecycle is the `uploadStatus` state machine (with `removed` as the soft-deletion terminal state).
 - **Tenant scope:** `libraries` carries `userId` directly. `artifacts` does **not** — its tenancy is derived from its parent library via `libraryId`. See the [Tenancy Rule](#tenancy-rule).
 - **Embedded value objects:** `sourceFile` is stored inline on the artifact document as an embedded sub-document (`{ storageUri, byteSize, mimeType, sha256Hash }`); the four fields are immutable for the artifact's lifetime.
-- **`storageUri` scheme (v1):** the domain treats `storageUri` as opaque, but in v1 (GR-002) the canonical scheme is `gridfs://<ObjectId>`, where `<ObjectId>` is the `_id` of the GridFS file in the `artifacts` bucket. Parsing of the scheme happens only inside `library-mongo.repo.ts`; no other module knows it exists. If the storage backend changes (e.g. S3, a `pdf-storage.gateway.ts`), only that repo and the URI scheme update.
-- **v1 default library:** GR-002 auto-provisions a single Default library named `"My Library"` per user on first sign-in/upload. The data model still supports many libraries per user; the v1 product just doesn't expose UI to create more.
 
 ## Collections
 

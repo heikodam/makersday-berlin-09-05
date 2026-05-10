@@ -1,120 +1,41 @@
-import { Buffer } from "node:buffer";
 import { Readable } from "node:stream";
 import busboy from "busboy";
 
-const FIELD_NAME = "file";
-
-export class MultipartParseError extends Error {
-  constructor(
-    public readonly status: number,
-    message: string,
-  ) {
-    super(message);
-    this.name = "MultipartParseError";
-  }
-}
-
-export class FileExceedsLimitError extends MultipartParseError {
-  constructor(maxByteSize: number) {
-    super(413, `File exceeds the ${Math.floor(maxByteSize / (1024 * 1024))} MB limit`);
-    this.name = "FileExceedsLimitError";
-  }
-}
-
-export interface ParsedUpload {
+export interface ParsedFile {
   fileName: string;
-  buffer: Buffer;
+  mimeType: string;
+  stream: Readable;
 }
 
-/**
- * Streams a single-file multipart/form-data request through busboy so we
- * never buffer the request body twice. Stops at `maxByteSize` and rejects
- * the request with a 413 before the application service is invoked.
- */
-export async function parseSingleFileUpload(
-  request: Request,
-  maxByteSize: number,
-): Promise<ParsedUpload> {
-  const declaredLength = request.headers.get("content-length");
-  if (declaredLength && Number(declaredLength) > maxByteSize + 1024 * 64) {
-    throw new FileExceedsLimitError(maxByteSize);
-  }
+export async function parseMultipartFile(request: Request, maxFileSize: number): Promise<ParsedFile> {
+  const contentType = request.headers.get("content-type") ?? "";
+  const bb = busboy({ headers: { "content-type": contentType }, limits: { fileSize: maxFileSize + 1 } });
 
-  if (!request.body) {
-    throw new MultipartParseError(400, "Missing request body");
-  }
-
-  const headers: Record<string, string> = {};
-  request.headers.forEach((value, key) => {
-    headers[key.toLowerCase()] = value;
-  });
-
-  const bb = busboy({
-    headers,
-    limits: {
-      files: 1,
-      fileSize: maxByteSize + 1,
-      fields: 0,
-    },
-  });
-
-  const bodyStream = Readable.fromWeb(request.body as Parameters<typeof Readable.fromWeb>[0]);
-
-  return new Promise<ParsedUpload>((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     let resolved = false;
-    let captured: ParsedUpload | null = null;
 
-    const fail = (err: Error): void => {
-      if (resolved) return;
-      resolved = true;
-      bodyStream.unpipe(bb);
-      bb.removeAllListeners();
-      reject(err);
-    };
-
-    bb.on("file", (fieldName, fileStream, info) => {
-      if (fieldName !== FIELD_NAME) {
+    bb.on("file", (_fieldname, fileStream, info) => {
+      if (resolved) {
         fileStream.resume();
         return;
       }
-      const chunks: Buffer[] = [];
-      let total = 0;
-      let limitHit = false;
-      fileStream.on("data", (chunk: Buffer) => {
-        total += chunk.length;
-        chunks.push(chunk);
-      });
-      fileStream.on("limit", () => {
-        limitHit = true;
-        fail(new FileExceedsLimitError(maxByteSize));
-      });
-      fileStream.on("end", () => {
-        if (limitHit) return;
-        if (total > maxByteSize) {
-          fail(new FileExceedsLimitError(maxByteSize));
-          return;
-        }
-        captured = {
-          fileName: info.filename ?? "upload.pdf",
-          buffer: Buffer.concat(chunks, total),
-        };
-      });
-      fileStream.on("error", fail);
-    });
-
-    bb.on("error", (err) => fail(err instanceof Error ? err : new Error(String(err))));
-    bb.on("filesLimit", () => fail(new MultipartParseError(400, "Only one file is allowed")));
-    bb.on("close", () => {
-      if (resolved) return;
       resolved = true;
-      if (!captured) {
-        reject(new MultipartParseError(400, `Missing required field: ${FIELD_NAME}`));
-        return;
-      }
-      resolve(captured);
+      resolve({
+        fileName: info.filename,
+        mimeType: info.mimeType,
+        stream: fileStream as unknown as Readable,
+      });
     });
 
-    bodyStream.on("error", fail);
-    bodyStream.pipe(bb);
+    bb.on("error", reject);
+    bb.on("close", () => {
+      if (!resolved) reject(new Error("No file found in multipart upload"));
+    });
+
+    if (!request.body) {
+      reject(new Error("No request body"));
+      return;
+    }
+    Readable.fromWeb(request.body as Parameters<typeof Readable.fromWeb>[0]).pipe(bb);
   });
 }

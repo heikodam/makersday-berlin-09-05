@@ -1,16 +1,11 @@
 import { z } from "zod";
 
-export const libraryNameSchema = z
-  .string()
-  .transform((value) => value.trim())
-  .pipe(z.string().min(1));
-
 export const librarySchema = z.object({
   id: z.string().uuid(),
   userId: z.string().uuid(),
-  name: libraryNameSchema,
+  name: z.string().transform((v) => v.trim()).pipe(z.string().min(1)),
   description: z.string().optional(),
-  isActive: z.boolean(),
+  isActive: z.boolean().default(true),
   createdAt: z.date(),
   updatedAt: z.date(),
 });
